@@ -9,213 +9,24 @@
 行为、配置格式、命令行参数、HTTP API 与状态继承格式尽量与原 Go 版本保持一致，
 运行时改为 pthread + AF_PACKET，可在 OpenWrt 上静态链接部署。
 
-## 依赖（均为成熟第三方库）
-
-依赖以 **git submodule** 方式放在 `third_party/`，不依赖系统开发包，便于交叉编译：
-
-| 库 | 用途 | 许可证 |
-| --- | --- | --- |
-| [tomlc99](https://github.com/cktan/tomlc99) | TOML 配置解析 | MIT |
-| [cJSON](https://github.com/DaveGamble/cJSON) | HTTP API 的 JSON 编解码 | MIT |
-| [uthash](https://github.com/troydhanson/uthash) | 检测器 / 封禁状态的哈希表与集合 | BSD-1-Clause |
-| [picohttpparser](https://github.com/h2o/picohttpparser) | HTTP/1.1 请求行与请求头解析 | MIT / Perl |
-
-系统库：`pthread`（线程）、Linux `AF_PACKET` + 经典 BPF（抓包，内核 API，无 libpcap 依赖）。
-
-### 为什么用 submodule 而不是包管理器
-
-- 路由器固件普遍要求**可复现的静态构建**：submodule 固定到具体 commit，交叉编译时不需要
-  目标平台具备包管理器；
-- 四个依赖都很小、无传递依赖，直接 `make` 最省事；
-- 如团队已有依赖管理流程，也可以把这些库换成 **Conan / vcpkg / Meson WrapDB** 中的包，
-  只需保证头文件与源文件路径可被 Makefile 找到；本项目没有私有构建逻辑，替换成本很低。
-
-首次检出后拉取依赖：
-
-```bash
-git submodule update --init --recursive
-# 或
-make deps
-```
-
 ## 编译
 
-需要支持 C23 的编译器（GCC 13+ / Clang 16+）：
+需要支持 C23 的编译器（GCC 13+ / Clang 16+）；依赖（tomlc99 / cJSON / uthash /
+picohttpparser）以 **git submodule** 放在 `third_party/`，首次检出后拉取：
 
 ```bash
-make / make build   # 本机架构构建，产出 bin/pcdn-detect + bin/pcdn-detect.debug
-make -j4
-make all            # 多 CPU 架构构建，产物 bin/pcdn-detect-<arch>
-make <arch>         # 单个架构：mipsle / mips / armv7 / arm64 / amd64
-make test           # 构建并运行单元测试 / HTTP 集成测试 / CLI 冒烟测试
-make DEBUG=1        # 保留完整调试符号，不拆分 .debug 文件
-make STATIC=1       # Musl libc 全静态构建（见下文，用于跨系统分发）
-make STATIC=1 test  # 用 musl 静态工具链重跑全部测试
-make PIE=0          # 关闭 PIE（默认开启）
-make clean          # 清理 build/ 与 bin/
+git submodule update --init --recursive   # 或 make deps
+make                                      # 本机构建，产出 bin/pcdn-detect
+make -j4 && make test                     # 并行构建 + 单元 / HTTP / CLI 测试
+make STATIC=1                             # Musl 全静态，拷到任意 Linux 直接运行
+make all                                  # 多架构静态产物 bin/pcdn-detect-<arch>
+make DEBUG=1                              # 保留完整调试符号
+make PIE=0                                # 关闭 PIE（默认开启）
+make clean                                # 清理 build/ 与 bin/
 ```
 
-默认开启 PIE（与静态/动态无关）：动态链接产出 `pie executable`，静态链接产出
-`static-pie linked`，两者都保留 ASLR。`PIE=0` 显式关闭，产出固定加载地址的可执行文件
-（个别老内核或需要固定地址调试的场景才需要）。
-
-默认发布构建（`DEBUG=0`）会：
-
-1. 正常链接带 `-g` 的可执行文件；
-2. 用 `objcopy --only-keep-debug` 生成 `bin/pcdn-detect.debug`（完整调试信息）；
-3. 用 `strip --strip-unneeded` 精简 `bin/pcdn-detect`；
-4. 写入 `.gnu_debuglink`，调试时 `gdb ./bin/pcdn-detect` 会自动加载同目录的
-   `pcdn-detect.debug`。
-
-`DEBUG=1` 跳过 2~4 步，调试信息完整保留在可执行文件里。
-
-可用变量：
-
-```bash
-# 保留符号表，只删调试段
-make STRIP_FLAGS=--strip-debug
-
-# 自定义 binutils（交叉编译使用 clang 或非 *-gcc 工具链时）
-make CC=aarch64-linux-gnu-clang \
-     OBJCOPY=aarch64-linux-gnu-objcopy STRIP=aarch64-linux-gnu-strip
-
-# 不剥离，直接产出带完整调试信息的二进制
-make DEBUG=1
-```
-
-`DEBUG` / `STATIC` / `PIE` / `ARCH` 的取值变化时会自动重新链接，不同组合的目标文件也分目录
-存放（`build/local`、`build/static`、`build/<arch>`，PIE=0 时加 `-nopie` 后缀），
-来回切换不需要 `make clean`。
-
-### 多架构构建
-
-`make all` 按 Go 版本的命名产出各架构二进制。**产物是纯静态 ELF，与部署发行版无关**，
-不需要 OpenWrt 的任何东西：用的是通用 musl 交叉工具链，OpenWrt 官方工具链只是同架构的
-备选，谁在 `PATH` 里就用谁。缺失的架构会打印提示并跳过，不会中断整体构建：
-
-| 产物 | 典型目标 | 候选工具链（按顺序取第一个存在的） |
-| --- | --- | --- |
-| `bin/pcdn-detect-mipsle` | ramips / mt7621 (mipsel_24kc) | `mipsel-linux-muslsf-gcc`、`mipsel-linux-musl-gcc`、`mipsel-openwrt-linux-musl-gcc` |
-| `bin/pcdn-detect-mips` | ar71xx / ath79 (mips_24kc) | `mips-linux-muslsf-gcc`、`mips-linux-musl-gcc`、`mips-openwrt-linux-musl-gcc` |
-| `bin/pcdn-detect-armv7` | arm_cortex-a7 / a9 | `armv7l-linux-musleabihf-gcc`、`arm-linux-musleabihf-gcc`、`arm-openwrt-linux-musl-gcc` |
-| `bin/pcdn-detect-arm64` | aarch64_cortex-a53 | `aarch64-linux-musl-gcc`、`aarch64-openwrt-linux-musl-gcc` |
-| `bin/pcdn-detect-amd64` | x86-64 | `musl-gcc`、`x86_64-linux-musl-gcc`、`cc`（musl 发行版） |
-
-MIPS 路由器 24Kc 无 FPU，所以 `mips`/`mipsle` 优先选 soft-float 工具链（`muslsf`）。
-
-工具链来源（任选其一，都是普通 Linux 上的 musl 交叉工具链）：
-
-```bash
-# musl.cc 预编译 tarball：解压即用，把 bin/ 加进 PATH
-wget https://musl.cc/aarch64-linux-musl-cross.tgz && tar xf aarch64-linux-musl-cross.tgz
-export PATH=$PWD/aarch64-linux-musl-cross/bin:$PATH
-
-# Alpine 包：aarch64-linux-musl-gcc 等
-apk add gcc-aarch64-linux-musl
-
-# OpenWrt SDK：mipsel-openwrt-linux-musl-gcc 等
-```
-
-命名不同或不在 `PATH` 时按架构覆盖：
-
-```bash
-make all CC_arm64=aarch64-linux-musl-gcc
-make arm64 CC_arm64=/opt/musl-cross/bin/aarch64-linux-musl-gcc
-```
-
-单架构构建（`make <arch>`）固定为静态链接，等价于：
-
-```bash
-make ARCH=arm64 CC=aarch64-linux-musl-gcc STATIC=1
-```
-
-架构列表由 `ARCHS` 定义，需要增删（例如补 `mips64`、`riscv64`）时改这一行并补上
-对应的 `CC_<arch>` 即可。
-
-> 以上只是「编出某个架构的静态二进制」。若目标就是本机 x86-64（Debian / Ubuntu /
-> CentOS / 容器），不需要任何交叉工具链，`make STATIC=1` 就够了。
-
-### 静态构建（Musl libc）
-
-要产出「拷到任意 Linux 上就能跑」的单文件，在**任意普通 Linux**（Debian / Ubuntu /
-CentOS / Fedora / Alpine / 容器）上加 `STATIC=1` 即可，不需要 OpenWrt SDK，也不需要
-目标平台的任何 libc：
-
-```bash
-make STATIC=1        # 本机自动选 musl 工具链（musl-gcc / x86_64-linux-musl-gcc / cc）
-make STATIC=1 test   # 用同一套 musl 静态工具链跑完整测试（含 HTTP 集成测试）
-```
-
-静态产物只依赖内核 ABI（`AF_PACKET` + `TPACKET_V2`，Linux 3.2+），所以在 glibc 发行版上
-编译、拷到 musl 路由器上运行是完全正常的组合，反之亦然。
-
-本机 musl 工具链按需安装：
-
-```bash
-apt install musl-tools     # Debian / Ubuntu，提供 musl-gcc
-dnf install musl-gcc       # Fedora
-# Alpine / OpenWrt 的 cc 本身就是 musl，无需额外安装
-```
-
-**为什么不用 `LDFLAGS=-static` + glibc**：glibc 静态链接时 `getaddrinfo` / NSS 仍要
-`dlopen` 加载 NSS 模块，静态产物在运行期会静默失效（域名的监听地址解析、`/etc/hosts`
-之外的主机名等），且依然依赖宿主 `/etc` 下的配置。Musl 的静态 libc 是自洽的：DNS 解析、
-`/etc/hosts`、时区、pthread 全部编进 libc。因此 `STATIC=1` 会先探测编译器，若发现是
-glibc 就直接报错，而不是产出一个「能编译、运行期失灵」的二进制；链接完成后还会校验产物
-确实是 `statically linked`。
-
-交叉编译直接见上一节「多架构构建」：`make all` / `make <arch>` 产出的都是静态二进制。
-
-静态构建相关变量：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `STATIC` | `0` | `1` 全静态链接，并校验编译器不是 glibc |
-| `PIE` | `1` | 默认开启：动态链接用 `-pie`、静态链接用 `-static-pie`（配套 `-fPIE`），保留 ASLR；`PIE=0` 显式关闭 |
-| `ARCH` | 空（本机架构） | 目标架构，决定产物名 `bin/pcdn-detect-<arch>` 与默认工具链 |
-| `ARCHS` | `mipsle mips armv7 arm64 amd64` | `make all` 构建的架构列表 |
-| `CC_<arch>` | 按候选列表探测（见「多架构构建」） | 各架构的交叉工具链，可覆盖 |
-| `MUSL_CC` | `musl-gcc` → `x86_64-linux-musl-gcc` → `cc` | 本机静态构建（`amd64`）使用的编译器，按上述顺序取第一个存在的 |
-| `KERNEL_HEADERS_DIR` | `/usr/include` | 编译器找不到内核头文件时（如 Fedora 的 `musl-gcc`）追加的目录，用 `-idirafter` 追加，musl 自身头文件始终优先 |
-
-产物（x86-64，`-O2 -g` 后 strip，默认 PIE）：
-
-```
-bin/pcdn-detect         ≈ 434 KiB   static-pie linked，无 PT_INTERP
-bin/pcdn-detect.debug   ≈ 1.6 MiB   调试符号（gdb 自动加载）
-```
-
-验证与分发：
-
-```bash
-file bin/pcdn-detect                       # static-pie linked
-readelf -l bin/pcdn-detect | grep INTERP   # 应无输出
-scp bin/pcdn-detect root@router:/usr/bin/  # 拷过去直接运行，无需目标机有对应 libc
-```
-
-`PIE=0` 时产物是普通 `statically linked` 可执行文件，体积略小（≈ 414 KiB）。
-
-与 libc 无关、但仍属于系统层面的运行时前提：
-
-- 抓包需 root + `CAP_NET_RAW`，并读取 `/proc`；内核需支持 `AF_PACKET` + `TPACKET_V2`（Linux 3.2+）；
-- `[log] timezone` 使用 IANA 名称（如 `Asia/Shanghai`）时，目标系统需存在
-  `/usr/share/zoneinfo`（Alpine 需装 `tzdata`）；用 POSIX 偏移写法（如 `8:00`、`CST-8`）则无此依赖；
-- 选择 `iptables` / `nftables` 后端时需要目标系统有对应命令；`hook` 后端无外部依赖。
-
-验证调试信息是否已拆分：
-
-```bash
-file bin/pcdn-detect bin/pcdn-detect.debug
-readelf -S bin/pcdn-detect | grep debug       # 主程序应无 .debug_* 段
-readelf -p .gnu_debuglink bin/pcdn-detect     # 应显示 pcdn-detect.debug
-```
-
-版本号通过 `-DPCDN_BASE_VERSION` / `-DPCDN_GIT_HASH` 注入，默认取当前 git 短哈希：
-
-```bash
-make GIT_HASH=dev
-./bin/pcdn-detect --version    # 0.0.1-beta.1+dev
-```
+依赖与 submodule 说明、调试符号拆分、交叉工具链、`build-all-static.sh`、静态构建原理、
+构建变量与产物校验见 [构建与交叉编译](docs/build.md)。
 
 ## 运行
 
@@ -289,8 +100,8 @@ list_mode = "whitelist"
 ```
 
 `[http]`、`[firewall]`、`[full_ban]`、`[upnp]` 的字段与语义和 Go 版本一致，详见生成模板
-中的注释。防火墙支持 `hook` / `iptables` / `nftables` 三种后端；UPnP 拦截与全 UDP 端口
-封禁复用同一后端。
+中的注释与下文各专题文档。防火墙支持 `hook` / `iptables` / `nftables` 三种后端；UPnP 拦截与
+全 UDP 端口封禁复用同一后端。
 
 配置热重载：
 
@@ -299,26 +110,48 @@ kill -HUP <pid>                        # 始终可用
 curl -XPOST localhost:8080/api/v1/reload   # 启用 [http] 后
 ```
 
-## HTTP API
+## 进阶配置
 
-默认关闭；开启后默认只监听 `127.0.0.1:8080`。绑定非回环地址必须配置 token。
+以下为按需查阅的详细说明，初次使用可按上文默认值直接运行：
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/api/v1/health` | `{"status":"ok","uptime_seconds":N}` |
-| GET | `/api/v1/status` | 设备 / 告警 / 封禁计数 |
-| GET | `/api/v1/devices` | 设备级 IPv4 / IPv6 端口统计 |
-| GET | `/api/v1/device?mac=...` | 单设备端口明细（`family` / `state` / `limit` / `page`） |
-| GET | `/api/v1/peers?mac=&port=` | 单端口对端 IP（`proto` / `v6` / `limit` / `page`） |
-| GET | `/api/v1/blocks` | 当前端口级 / 全端口 / UPnP 封禁状态 |
-| POST | `/api/v1/unban` | `{"mac":"aa:bb:cc:dd:ee:ff","port":40000,"proto":"udp"}` |
-| POST | `/api/v1/reload` | 重载配置 |
-| GET | `/dev/memory` | C 运行时统计（RSS / 线程数 / 设备数等） |
+- [内存占用与低内存优化](docs/memory.md)：内核抓包缓冲与 `snaplen`、`low_memory` /
+  `peer_limit` / `max_ports` 等内存控制项；C 版本没有 GC，`memory_limit` / `gc_percent`
+  仅兼容保留。
+- [黑白名单](docs/filter.md)：`[filter]` 按设备 MAC（可限定端口）过滤检测范围。
+- [防火墙对接](docs/firewall.md)：`[firewall]` 自动封禁 / 解封（hook / iptables / nftables），
+  含 [全 UDP 端口封禁模式](docs/firewall.md#全-udp-端口封禁模式full_ban)。
+- [UPnP 拦截](docs/upnp.md)：`[upnp]` 拦截设备向路由器发起的 UPnP 请求。
+- [HTTP API](docs/http.md)：`[http]` 运行时状态读取、手动解封、重载配置（含跨重启继承封禁状态）；
+  配置热重载也可通过 `SIGHUP`（procd 的 `reload` 默认发送该信号）触发，HTTP 关闭时仍可用。
 
-支持 Bearer 鉴权（`Authorization: Bearer <token>`）、CORS 预检与 `token = "allow-no-token"`
-显式关闭鉴权；行为与原项目 `docs/http.md` 描述的 Go 版本一致。`/dev/memory` 因运行时不同，
-返回 `version` / `uptime_seconds` / `num_cpu` / `threads` / `rss_bytes` / `vm_bytes` 等
-C 侧字段，而不是 Go 的 `MemStats`。
+HTTP API 默认关闭；开启后默认只监听 `127.0.0.1:8080`，绑定非回环地址必须配置 token。
+端点、鉴权、CORS 与传输层限制见 [HTTP API](docs/http.md)。
+
+### 隐私模式（`hide_address`）
+
+开启后（配置文件 `hide_address = true`，或命令行 `-H` / `--hide-address`），日志中会**隐藏设备自身的身份信息**：
+
+- **MAC** 与**设备的 IPv6** 只保留**前两段与最后一段**，中间以 `...` 省略：
+  `60:21:01:1b:0a:23` → `60:21:...:23`，`2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3` → `2408:8240:...:b2a3`。
+- **设备的公网 IPv4** 只保留**首段与末段**，中间两段以 `*` 替换：`112.245.115.51` → `112.*.*.51`。
+- **内网 IPv4**（如 `192.168.1.100`）不属于公网地址，**保持原样**。
+- 只隐藏**设备自己**的地址；**设备外连的远端对端 IP**（告警中的「相关IP」）**不受影响**，始终完整展示。
+
+> 该选项仅影响**日志展示**，不影响黑白名单过滤、防火墙封禁与 HTTP API（API 返回原始值）。
+> 支持热重载即时生效。
+
+### 日志等级（`level`）
+
+`[log] level` 控制输出多少日志，取值 `debug` / `info` / `warn` / `error`（默认 `warn`）：
+
+| 等级 | 输出内容 |
+| --- | --- |
+| `warn`（默认） | 只有警告与错误（配置项被忽略、封禁 / 解封失败、端口被丢弃等） |
+| `info` | 额外输出启动参数、检测告警（疑似 / 持续产生 PCDN 行为、行为结束）、封禁 / 解封、UPnP 拦截、抓包缓冲等业务事件 |
+| `debug` | 额外输出调试信息 |
+
+> 调试或排查封禁问题时把 `level` 设为 `"info"`，即可看到「已封禁 / 已解封 / 持续产生PCDN行为」等记录；
+> 该等级支持热重载（`SIGHUP` / `POST /api/v1/reload`）即时生效。
 
 ## 目录结构
 
@@ -339,6 +172,13 @@ src/
 tests/
   test_core.c  配置 / 过滤 / 检测 / 状态文件
   test_http.c  HTTP API 鉴权 / CORS / 路由 / reload / 内存接口
+docs/
+  build.md     依赖、本机 / 交叉 / 静态构建、产物校验
+  memory.md    抓包缓冲 / snaplen / 内存控制项
+  filter.md    黑白名单
+  firewall.md  防火墙对接与全 UDP 端口封禁
+  upnp.md      UPnP 拦截
+  http.md      HTTP API、CORS、reload 与状态继承
 ```
 
 ## 与 Go 版本的差异
