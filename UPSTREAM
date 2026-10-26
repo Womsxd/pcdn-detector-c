@@ -1,0 +1,19 @@
+# 上游 Go 实现基准提交
+#
+# 本仓库是 Womsxd/pcdn-detector 的 C23 重写实现：行为、配置格式、命令行参数、
+# HTTP API 与状态文件格式均以本文件记录的提交为基准对齐。升级上游后按下方步骤比对。
+#
+# 比对方式（$UPSTREAM 指向上游仓库的检出目录）：
+#   git -C "$UPSTREAM" log --oneline <commit>..HEAD
+#   git -C "$UPSTREAM" diff <commit>..HEAD -- docs internal cmd README.md
+#
+# 核对完成后更新本文件的 commit / date / version / subject 字段。
+#
+# repo / mirror 为同一仓库的 GitHub 与 CNB 镜像地址，二者提交一致。
+
+repo    = "https://github.com/Womsxd/pcdn-detector"
+mirror  = "https://cnb.cool/womsxd/pcdn-detector"
+commit  = "92d423b9e7fa1f16d73da5bec547568c33b1b544"
+date    = "2026-10-25T23:29:40+08:00"
+version = "0.0.1-beta.1"
+subject = "chore: 版本号升级至 0.0.1-beta.1"
