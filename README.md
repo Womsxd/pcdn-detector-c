@@ -1,11 +1,10 @@
-# pcdn-detect（C23 重写版）
+# pcdn-detect
 
 在 OpenWrt / Linux 路由器上运行的 P2P CDN 行为检测工具。按设备 MAC + 本地端口统计
 滑动窗口内的不同远端公网 IP 数量，达到阈值后输出告警，并可选地对接防火墙封禁、
 全 UDP 端口封禁与 UPnP 拦截。
 
-本仓库是 [Womsxd/pcdn-detector](https://github.com/Womsxd/pcdn-detector)
-（[CNB 镜像](https://cnb.cool/womsxd/pcdn-detector)）的 **C23 重写实现**：
+本仓库是 [Womsxd/pcdn-detector](https://github.com/Womsxd/pcdn-detector)的 **C23 重写实现**：
 行为、配置格式、命令行参数、HTTP API 与状态继承格式尽量与原 Go 版本保持一致，
 运行时改为 pthread + AF_PACKET，可在 OpenWrt 上静态链接部署。
 
@@ -221,7 +220,19 @@ make test
   `/dev/memory`、`/reload`；
 - CLI：版本、`--init-config`、`-T` 校验（缺少网卡应失败）。
 
-## 许可证
+## 贡献
 
-第三方库保留各自许可证（见 `third_party` 各仓库的 LICENSE
-或源文件头）。
+欢迎提交 issue 与 PR，请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)（含开发环境、
+检查项与 PR 流程）。提交 PR 即表示您同意 [`CLA.md`](CLA.md)，且每个提交都需要
+`Signed-off-by` 签署行（`git commit -s`）。
+
+## 许可证与 CLA
+
+本项目以 [GNU General Public License v3.0](LICENSE) 分发，与上游
+[pcdn-detector](https://github.com/Womsxd/pcdn-detector) 保持一致。
+
+提交 Pull Request 即表示您同意[贡献者许可协议（CLA）](CLA.md)，该协议适用于您当前及
+未来的所有贡献。提交前请阅读[贡献指南](CONTRIBUTING.md)（含 DCO 签署要求）。
+
+第三方库保留各自许可证（见 `third_party` 各仓库的 LICENSE 或源文件头）：
+tomlc99 / cJSON / picohttpparser 为 MIT，uthash 为 BSD-1-Clause。
