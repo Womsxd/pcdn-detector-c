@@ -1,0 +1,1428 @@
+#include "blocker.h"
+
+#include <ctype.h>
+#include <pthread.h>
+
+#include "uthash.h"
+#include "util.h"
+
+#define QUEUE_CAP 256
+#define PROTO_UDP "udp"
+#define PROTO_TCP "tcp"
+
+typedef struct {
+    bool ban;
+    char mac[18];
+    char ip[64];
+    uint16_t port;
+    char proto[4];
+} block_event;
+
+typedef struct ban_state {
+    char key[96];
+    char mac[18];
+    char proto[4];
+    char ips[2][64];
+    uint16_t port;
+    uint32_t refs[2];
+    uint8_t fam;
+    uint8_t last;
+    bool applied;
+    UT_hash_handle hh;
+} ban_state;
+
+typedef struct {
+    char key[32]; /* mac:port */
+    char mac[18];
+    uint16_t port;
+    int refs;
+    UT_hash_handle hh;
+} port_ref;
+
+typedef struct {
+    char key[18];
+    UT_hash_handle hh;
+} str_set;
+
+typedef struct {
+    char key[18];
+    char val[64];
+    UT_hash_handle hh;
+} str_val;
+
+struct blocker {
+    firewall *fw;
+    bool hide;
+
+    pthread_t worker;
+    bool worker_started;
+    pthread_t refresher;
+    bool refresher_started;
+
+    pthread_mutex_t qmu;
+    pthread_cond_t qcond;
+    block_event queue[QUEUE_CAP];
+    int qhead;
+    int qtail;
+    int qcount;
+    bool stopping;
+    bool closed;
+
+    pthread_mutex_t mu;
+    ban_state *active;
+    port_ref *ports;
+    str_set *full_banned;
+    str_set *upnp_blocked;
+    str_set *upnp_allowed;
+    bool upnp_all;
+    str_val *dev_ip;
+
+    bool fb_enabled;
+    char fb_mode[16];
+    int fb_threshold;
+    str_set *fb_devices;
+
+    bool up_enabled;
+    bool up_block_all;
+    str_set *up_targets;
+};
+
+/* ------------------------------------------------------------------ */
+/* 集合辅助                                                            */
+/* ------------------------------------------------------------------ */
+
+static bool set_contains(str_set *s, const char *key)
+{
+    str_set *e = NULL;
+    HASH_FIND_STR(s, key, e);
+    return e != NULL;
+}
+
+static void set_add(str_set **s, const char *key)
+{
+    if (set_contains(*s, key))
+        return;
+    str_set *e = xcalloc(1, sizeof(*e));
+    snprintf(e->key, sizeof(e->key), "%s", key);
+    HASH_ADD_STR(*s, key, e);
+}
+
+static void set_del(str_set **s, const char *key)
+{
+    str_set *e = NULL;
+    HASH_FIND_STR(*s, key, e);
+    if (e) {
+        HASH_DEL(*s, e);
+        free(e);
+    }
+}
+
+static void set_free(str_set **s)
+{
+    str_set *e, *tmp;
+    HASH_ITER(hh, *s, e, tmp)
+    {
+        HASH_DEL(*s, e);
+        free(e);
+    }
+    *s = NULL;
+}
+
+static void set_keys(str_set *s, char ***out, size_t *n)
+{
+    *out = NULL;
+    *n = 0;
+    size_t count = HASH_COUNT(s);
+    if (count == 0)
+        return;
+    char **arr = xmalloc(count * sizeof(char *));
+    size_t i = 0;
+    for (str_set *e = s; e; e = e->hh.next)
+        arr[i++] = xstrdup(e->key);
+    *out = arr;
+    *n = i;
+}
+
+static const char *dev_ip_get_nolock(blocker *b, const char *mac)
+{
+    str_val *e = NULL;
+    HASH_FIND_STR(b->dev_ip, mac, e);
+    return e ? e->val : "";
+}
+
+static const char *dev_ip_get(blocker *b, const char *mac)
+{
+    pthread_mutex_lock(&b->mu);
+    str_val *e = NULL;
+    HASH_FIND_STR(b->dev_ip, mac, e);
+    const char *ret = e ? e->val : "";
+    pthread_mutex_unlock(&b->mu);
+    return ret;
+}
+
+static void dev_ip_set(blocker *b, const char *mac, const char *ip)
+{
+    if (!ip || !ip[0])
+        return;
+    str_val *e = NULL;
+    HASH_FIND_STR(b->dev_ip, mac, e);
+    if (!e) {
+        e = xcalloc(1, sizeof(*e));
+        snprintf(e->key, sizeof(e->key), "%s", mac);
+        HASH_ADD_STR(b->dev_ip, key, e);
+    }
+    snprintf(e->val, sizeof(e->val), "%s", ip);
+}
+
+static void fmt_masked(bool hide, const char *mac, const char *ip, char *mb, size_t mcap,
+                       char *ib, size_t icap)
+{
+    char e[128];
+    pcdn_mac m;
+    if (mac && mac_parse(mac, &m, e, sizeof(e)))
+        mask_device_mac(hide, &m, mb, mcap);
+    else
+        snprintf(mb, mcap, "%s", mac ? mac : "");
+    if (ip && ip[0]) {
+        pcdn_ip a;
+        if (ip_parse(ip, &a, e, sizeof(e)))
+            mask_device_ip(hide, &a, ib, icap);
+        else
+            snprintf(ib, icap, "%s", ip);
+    } else {
+        if (icap)
+            ib[0] = '\0';
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 引用计数                                                            */
+/* ------------------------------------------------------------------ */
+
+static int fam_idx(const char *ip)
+{
+    return (ip && strchr(ip, ':')) ? 1 : 0;
+}
+
+static const char *fam_name(int idx)
+{
+    return idx == 1 ? "v6" : "v4";
+}
+
+static int state_total(const ban_state *st)
+{
+    return (int)st->refs[0] + (int)st->refs[1];
+}
+
+static const char *state_ip(const ban_state *st)
+{
+    return st->ips[st->last];
+}
+
+static void make_port_key(const char *mac, uint16_t port, char *buf, size_t cap)
+{
+    snprintf(buf, cap, "%s:%u", mac, port);
+}
+
+static void bump_port_locked(blocker *b, const char *mac, uint16_t port, int delta)
+{
+    char key[32];
+    make_port_key(mac, port, key, sizeof(key));
+    port_ref *e = NULL;
+    HASH_FIND_STR(b->ports, key, e);
+    if (!e) {
+        if (delta <= 0)
+            return;
+        e = xcalloc(1, sizeof(*e));
+        snprintf(e->key, sizeof(e->key), "%s", key);
+        snprintf(e->mac, sizeof(e->mac), "%s", mac);
+        e->port = port;
+        HASH_ADD_STR(b->ports, key, e);
+    }
+    e->refs += delta;
+    if (e->refs <= 0) {
+        HASH_DEL(b->ports, e);
+        free(e);
+    }
+}
+
+static int dev_port_count_locked(blocker *b, const char *mac)
+{
+    int n = 0;
+    for (port_ref *e = b->ports; e; e = e->hh.next) {
+        if (strcmp(e->mac, mac) == 0 && e->refs > 0)
+            n++;
+    }
+    return n;
+}
+
+/* ------------------------------------------------------------------ */
+/* 日志 / 下发                                                         */
+/* ------------------------------------------------------------------ */
+
+static void apply_one(blocker *b, bool ban, const char *mac, const char *ip, uint16_t port,
+                      const char *proto)
+{
+    char mb[64], ib[64];
+    fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+    char label[8];
+    snprintf(label, sizeof(label), "%s", proto);
+    for (char *p = label; *p; p++)
+        *p = (char)toupper((unsigned char)*p);
+    int rc = ban ? firewall_ban(b->fw, mac, ip, port, proto)
+                 : firewall_unban(b->fw, mac, ip, port, proto);
+    if (rc != 0) {
+        log_error("%s设备 %s(%s) 的 %s 端口 %d 失败", ban ? "封禁" : "解封", mb, ib, label, port);
+        return;
+    }
+    log_info("已%s设备 %s(%s) 的 %s 端口 %d", ban ? "封禁" : "解封", mb, ib, label, port);
+}
+
+static void apply_full(blocker *b, bool ban, const char *mac, const char *ip);
+
+static void remove_redundant_port_rules(blocker *b, const char *mac)
+{
+    struct {
+        char ip[64];
+        uint16_t port;
+        char proto[4];
+    } *entries = NULL;
+    size_t n = 0;
+    pthread_mutex_lock(&b->mu);
+    for (ban_state *st = b->active; st; st = st->hh.next) {
+        if (strcmp(st->mac, mac) != 0 || !st->applied || strcmp(st->proto, PROTO_UDP) != 0)
+            continue;
+        st->applied = false;
+        entries = xrealloc(entries, (n + 1) * sizeof(*entries));
+        snprintf(entries[n].ip, sizeof(entries[n].ip), "%s", state_ip(st));
+        entries[n].port = st->port;
+        snprintf(entries[n].proto, sizeof(entries[n].proto), "%s", st->proto);
+        n++;
+    }
+    pthread_mutex_unlock(&b->mu);
+    for (size_t i = 0; i < n; i++)
+        apply_one(b, false, mac, entries[i].ip, entries[i].port, entries[i].proto);
+    free(entries);
+}
+
+static bool fullban_applies(blocker *b, const char *mac)
+{
+    if (!b->fb_enabled || !b->fw || !firewall_fullban_enabled(b->fw))
+        return false;
+    if (strcmp(b->fb_mode, "device") == 0)
+        return set_contains(b->fb_devices, mac);
+    return true;
+}
+
+static void apply_full(blocker *b, bool ban, const char *mac, const char *ip)
+{
+    char mb[64], ib[64];
+    fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+    if (ban) {
+        if (firewall_full_ban(b->fw, mac, ip) != 0) {
+            log_error("对设备 %s 执行全 UDP 端口封禁失败", mb);
+            pthread_mutex_lock(&b->mu);
+            set_del(&b->full_banned, mac);
+            pthread_mutex_unlock(&b->mu);
+            return;
+        }
+        size_t n = 0;
+        const uint16_t *ports = firewall_fullban_allow_ports(b->fw, &n);
+        strbuf sb;
+        sb_init(&sb);
+        for (size_t i = 0; i < n; i++)
+            sb_addf(&sb, "%s%u", i ? "," : "", ports[i]);
+        log_info("设备 %s 被封禁端口数达到 %d，已执行全 UDP 端口封禁（仅放行端口：%s）", mb,
+                 b->fb_threshold, sb.p ? sb.p : "");
+        sb_free(&sb);
+        remove_redundant_port_rules(b, mac);
+        return;
+    }
+    if (firewall_full_unban(b->fw, mac, ip) != 0) {
+        log_error("解除设备 %s 的全 UDP 端口封禁失败", mb);
+        return;
+    }
+    log_info("设备 %s 已无被封禁端口，已解除全 UDP 端口封禁", mb);
+}
+
+static void maybe_full_ban(blocker *b, const char *mac, const char *ip)
+{
+    if (!fullban_applies(b, mac))
+        return;
+    pthread_mutex_lock(&b->mu);
+    int count = dev_port_count_locked(b, mac);
+    bool active = set_contains(b->full_banned, mac);
+    bool do_ban = false, do_unban = false;
+    if (!active && count >= b->fb_threshold) {
+        set_add(&b->full_banned, mac);
+        do_ban = true;
+    } else if (active && count == 0) {
+        set_del(&b->full_banned, mac);
+        do_unban = true;
+    }
+    pthread_mutex_unlock(&b->mu);
+    if (do_ban)
+        apply_full(b, true, mac, ip);
+    else if (do_unban)
+        apply_full(b, false, mac, ip);
+}
+
+static bool upnp_active(blocker *b)
+{
+    return b->up_enabled && b->fw && firewall_upnp_enabled(b->fw);
+}
+
+static bool apply_upnp_ban(blocker *b, bool ban, const char *mac)
+{
+    if (!upnp_active(b))
+        return false;
+    pthread_mutex_lock(&b->mu);
+    bool already = set_contains(b->upnp_blocked, mac);
+    pthread_mutex_unlock(&b->mu);
+    if (ban == already)
+        return false;
+
+    char mb[64], ib[64];
+    fmt_masked(b->hide, mac, dev_ip_get(b, mac), mb, sizeof(mb), ib, sizeof(ib));
+    if (ban) {
+        if (firewall_upnp_ban(b->fw, mac, dev_ip_get(b, mac)) != 0) {
+            log_error("拦截设备 %s 的 UPnP 请求失败", mb);
+            return false;
+        }
+        pthread_mutex_lock(&b->mu);
+        set_add(&b->upnp_blocked, mac);
+        pthread_mutex_unlock(&b->mu);
+        log_info("已拦截设备 %s 的 UPnP 请求", mb);
+        return true;
+    }
+    if (firewall_upnp_unban(b->fw, mac, dev_ip_get(b, mac)) != 0) {
+        log_error("解除设备 %s 的 UPnP 拦截失败", mb);
+        return false;
+    }
+    pthread_mutex_lock(&b->mu);
+    set_del(&b->upnp_blocked, mac);
+    pthread_mutex_unlock(&b->mu);
+    log_info("已解除设备 %s 的 UPnP 拦截", mb);
+    return true;
+}
+
+static bool apply_upnp_allow(blocker *b, bool allow, const char *mac)
+{
+    if (!upnp_active(b))
+        return false;
+    pthread_mutex_lock(&b->mu);
+    bool already = set_contains(b->upnp_allowed, mac);
+    pthread_mutex_unlock(&b->mu);
+    if (allow == already)
+        return false;
+
+    char mb[64], ib[64];
+    fmt_masked(b->hide, mac, dev_ip_get(b, mac), mb, sizeof(mb), ib, sizeof(ib));
+    if (allow) {
+        if (firewall_upnp_allow(b->fw, mac, dev_ip_get(b, mac)) != 0) {
+            log_error("放行设备 %s 的 UPnP 请求失败", mb);
+            return false;
+        }
+        pthread_mutex_lock(&b->mu);
+        set_add(&b->upnp_allowed, mac);
+        pthread_mutex_unlock(&b->mu);
+        log_info("已放行设备 %s 的 UPnP 请求", mb);
+        return true;
+    }
+    if (firewall_upnp_disallow(b->fw, mac, dev_ip_get(b, mac)) != 0) {
+        log_error("取消设备 %s 的 UPnP 放行失败", mb);
+        return false;
+    }
+    pthread_mutex_lock(&b->mu);
+    set_del(&b->upnp_allowed, mac);
+    pthread_mutex_unlock(&b->mu);
+    log_info("已取消设备 %s 的 UPnP 放行", mb);
+    return true;
+}
+
+static void apply_static_upnp(blocker *b)
+{
+    if (!upnp_active(b))
+        return;
+    if (b->up_block_all) {
+        if (firewall_upnp_block_all(b->fw) != 0) {
+            log_error("拦截全部 UPnP 请求失败");
+        } else {
+            pthread_mutex_lock(&b->mu);
+            b->upnp_all = true;
+            pthread_mutex_unlock(&b->mu);
+            log_info("已拦截全部进入路由器的 UPnP 请求");
+        }
+        for (str_set *e = b->up_targets; e; e = e->hh.next)
+            apply_upnp_allow(b, true, e->key);
+        return;
+    }
+    for (str_set *e = b->up_targets; e; e = e->hh.next)
+        apply_upnp_ban(b, true, e->key);
+}
+
+/* ------------------------------------------------------------------ */
+/* 事件处理                                                            */
+/* ------------------------------------------------------------------ */
+
+static void enqueue(blocker *b, const block_event *ev)
+{
+    pthread_mutex_lock(&b->qmu);
+    if (b->qcount >= QUEUE_CAP) {
+        pthread_mutex_unlock(&b->qmu);
+        char mb[64], ib[64];
+        fmt_masked(b->hide, ev->mac, ev->ip, mb, sizeof(mb), ib, sizeof(ib));
+        log_warn("警告：封禁事件队列已满，丢弃 %s:%u 的事件", mb, ev->port);
+        return;
+    }
+    b->queue[b->qtail] = *ev;
+    b->qtail = (b->qtail + 1) % QUEUE_CAP;
+    b->qcount++;
+    pthread_cond_signal(&b->qcond);
+    pthread_mutex_unlock(&b->qmu);
+}
+
+static void handle_event(blocker *b, const block_event *ev)
+{
+    char key[96];
+    if (firewall_ban_both(b->fw))
+        snprintf(key, sizeof(key), "%s:%u:%s", ev->mac, ev->port, ev->proto);
+    else
+        snprintf(key, sizeof(key), "%s:%u:%s:%s", ev->mac, ev->port, ev->proto,
+                 firewall_addr_family(ev->ip));
+
+    pthread_mutex_lock(&b->mu);
+    ban_state *st = NULL;
+    HASH_FIND_STR(b->active, key, st);
+    if (ev->ban) {
+        int i = fam_idx(ev->ip);
+        if (!st) {
+            st = xcalloc(1, sizeof(*st));
+            snprintf(st->key, sizeof(st->key), "%s", key);
+            snprintf(st->mac, sizeof(st->mac), "%s", ev->mac);
+            snprintf(st->proto, sizeof(st->proto), "%s", ev->proto);
+            st->port = ev->port;
+            st->fam = (uint8_t)i;
+            HASH_ADD_STR(b->active, key, st);
+            bump_port_locked(b, ev->mac, ev->port, 1);
+        }
+        st->refs[i]++;
+        snprintf(st->ips[i], sizeof(st->ips[i]), "%s", ev->ip);
+        st->last = (uint8_t)i;
+        dev_ip_set(b, ev->mac, ev->ip);
+        bool first = state_total(st) == 1;
+        bool full = strcmp(ev->proto, PROTO_UDP) == 0 &&
+                    set_contains(b->full_banned, ev->mac);
+        if (first)
+            st->applied = !full;
+        pthread_mutex_unlock(&b->mu);
+
+        if (first && !full)
+            apply_one(b, true, ev->mac, ev->ip, ev->port, ev->proto);
+        maybe_full_ban(b, ev->mac, ev->ip);
+        return;
+    }
+
+    if (!st) {
+        pthread_mutex_unlock(&b->mu);
+        return;
+    }
+    int i = fam_idx(ev->ip);
+    if (st->refs[i] > 0)
+        st->refs[i]--;
+    else if (st->refs[1 - i] > 0)
+        st->refs[1 - i]--;
+    bool last = state_total(st) <= 0;
+    char ip[64], proto[4];
+    bool applied = st->applied;
+    snprintf(ip, sizeof(ip), "%s", state_ip(st));
+    snprintf(proto, sizeof(proto), "%s", st->proto);
+    if (last) {
+        HASH_DEL(b->active, st);
+        free(st);
+        bump_port_locked(b, ev->mac, ev->port, -1);
+    }
+    pthread_mutex_unlock(&b->mu);
+
+    if (last && applied)
+        apply_one(b, false, ev->mac, ip, ev->port, proto);
+    maybe_full_ban(b, ev->mac, ev->ip);
+}
+
+static void *worker_main(void *arg)
+{
+    blocker *b = arg;
+    for (;;) {
+        pthread_mutex_lock(&b->qmu);
+        while (b->qcount == 0 && !b->stopping)
+            pthread_cond_wait(&b->qcond, &b->qmu);
+        if (b->stopping) {
+            pthread_mutex_unlock(&b->qmu);
+            return NULL;
+        }
+        block_event ev = b->queue[b->qhead];
+        b->qhead = (b->qhead + 1) % QUEUE_CAP;
+        b->qcount--;
+        pthread_mutex_unlock(&b->qmu);
+        handle_event(b, &ev);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 兜底解封 / 刷新                                                     */
+/* ------------------------------------------------------------------ */
+
+static void refresh_bans(blocker *b)
+{
+    if (!b->fw || firewall_ban_ttl(b->fw) <= 0)
+        return;
+    typedef struct {
+        char mac[18];
+        char ip[64];
+        uint16_t port;
+        char proto[4];
+        bool full;
+    } entry;
+    entry *list = NULL;
+    size_t n = 0;
+    pthread_mutex_lock(&b->mu);
+    for (ban_state *st = b->active; st; st = st->hh.next) {
+        if (!st->applied)
+            continue;
+        list = xrealloc(list, (n + 1) * sizeof(*list));
+        snprintf(list[n].mac, sizeof(list[n].mac), "%s", st->mac);
+        snprintf(list[n].ip, sizeof(list[n].ip), "%s", state_ip(st));
+        list[n].port = st->port;
+        snprintf(list[n].proto, sizeof(list[n].proto), "%s", st->proto);
+        list[n].full = false;
+        n++;
+    }
+    for (str_set *e = b->full_banned; e; e = e->hh.next) {
+        list = xrealloc(list, (n + 1) * sizeof(*list));
+        snprintf(list[n].mac, sizeof(list[n].mac), "%s", e->key);
+        snprintf(list[n].ip, sizeof(list[n].ip), "%s", dev_ip_get_nolock(b, e->key));
+        list[n].port = 0;
+        list[n].proto[0] = '\0';
+        list[n].full = true;
+        n++;
+    }
+    pthread_mutex_unlock(&b->mu);
+
+    int failed = 0;
+    for (size_t i = 0; i < n; i++) {
+        int rc = list[i].full ? firewall_full_ban(b->fw, list[i].mac, list[i].ip)
+                              : firewall_ban(b->fw, list[i].mac, list[i].ip, list[i].port,
+                                             list[i].proto);
+        if (rc != 0)
+            failed++;
+    }
+    free(list);
+    if (failed > 0)
+        log_warn("警告：刷新 %d 条封禁元素的超时失败（可能因刷新失败而提前失效）", failed);
+}
+
+static void *refresh_main(void *arg)
+{
+    blocker *b = arg;
+    int64_t last = mono_ms();
+    for (;;) {
+        pthread_mutex_lock(&b->qmu);
+        bool stop = b->stopping;
+        pthread_mutex_unlock(&b->qmu);
+        if (stop)
+            return NULL;
+        struct timespec req = {.tv_sec = 0, .tv_nsec = 200000000L};
+        nanosleep(&req, NULL);
+
+        int64_t ttl = b->fw ? firewall_ban_ttl(b->fw) : 0;
+        int64_t interval = ttl > 0 ? ttl / 3 : 60000000000LL;
+        if (interval < 1000000000LL)
+            interval = 1000000000LL;
+        if (mono_ms() - last >= interval / 1000000LL) {
+            last = mono_ms();
+            if (ttl > 0)
+                refresh_bans(b);
+        }
+    }
+}
+
+static void unban_all_rules(blocker *b)
+{
+    if (!b->fw)
+        return;
+    typedef struct {
+        char mac[18];
+        char ip[64];
+        uint16_t port;
+        char proto[4];
+    } target;
+    target *targets = NULL;
+    size_t nt = 0;
+    char **full = NULL, **blocked = NULL, **allowed = NULL;
+    size_t nfull = 0, nblocked = 0, nallowed = 0;
+    bool upnp_all;
+
+    pthread_mutex_lock(&b->mu);
+    for (ban_state *st = b->active; st; st = st->hh.next) {
+        if (!st->applied)
+            continue;
+        targets = xrealloc(targets, (nt + 1) * sizeof(*targets));
+        snprintf(targets[nt].mac, sizeof(targets[nt].mac), "%s", st->mac);
+        snprintf(targets[nt].ip, sizeof(targets[nt].ip), "%s", state_ip(st));
+        targets[nt].port = st->port;
+        snprintf(targets[nt].proto, sizeof(targets[nt].proto), "%s", st->proto);
+        nt++;
+    }
+    set_keys(b->full_banned, &full, &nfull);
+    set_keys(b->upnp_blocked, &blocked, &nblocked);
+    set_keys(b->upnp_allowed, &allowed, &nallowed);
+    upnp_all = b->upnp_all;
+    pthread_mutex_unlock(&b->mu);
+
+    for (size_t i = 0; i < nt; i++) {
+        char mb[64], ib[64], label[8];
+        fmt_masked(b->hide, targets[i].mac, targets[i].ip, mb, sizeof(mb), ib, sizeof(ib));
+        snprintf(label, sizeof(label), "%s", targets[i].proto);
+        for (char *p = label; *p; p++)
+            *p = (char)toupper((unsigned char)*p);
+        if (firewall_unban(b->fw, targets[i].mac, targets[i].ip, targets[i].port,
+                           targets[i].proto) != 0) {
+            log_error("解封设备 %s(%s) 的 %s 端口 %d 失败", mb, ib, label, targets[i].port);
+            continue;
+        }
+        log_info("已解封设备 %s(%s) 的 %s 端口 %d", mb, ib, label, targets[i].port);
+    }
+    for (size_t i = 0; i < nfull; i++) {
+        char mb[64], ib[64];
+        fmt_masked(b->hide, full[i], dev_ip_get(b, full[i]), mb, sizeof(mb), ib, sizeof(ib));
+        if (firewall_full_unban(b->fw, full[i], dev_ip_get(b, full[i])) != 0) {
+            log_error("解除设备 %s 的全 UDP 端口封禁失败", mb);
+            continue;
+        }
+        log_info("已解除设备 %s 的全 UDP 端口封禁", mb);
+    }
+    for (size_t i = 0; i < nblocked; i++) {
+        char mb[64], ib[64];
+        fmt_masked(b->hide, blocked[i], dev_ip_get(b, blocked[i]), mb, sizeof(mb), ib,
+                   sizeof(ib));
+        if (firewall_upnp_unban(b->fw, blocked[i], dev_ip_get(b, blocked[i])) != 0) {
+            log_error("解除设备 %s 的 UPnP 拦截失败", mb);
+            continue;
+        }
+        log_info("已解除设备 %s 的 UPnP 拦截", mb);
+    }
+    for (size_t i = 0; i < nallowed; i++) {
+        char mb[64], ib[64];
+        fmt_masked(b->hide, allowed[i], dev_ip_get(b, allowed[i]), mb, sizeof(mb), ib,
+                   sizeof(ib));
+        if (firewall_upnp_disallow(b->fw, allowed[i], dev_ip_get(b, allowed[i])) != 0) {
+            log_error("取消设备 %s 的 UPnP 放行失败", mb);
+            continue;
+        }
+        log_info("已取消设备 %s 的 UPnP 放行", mb);
+    }
+    if (upnp_all) {
+        if (firewall_upnp_unblock_all(b->fw) != 0)
+            log_error("解除全部 UPnP 拦截失败");
+        else
+            log_info("已解除全部 UPnP 拦截");
+    }
+    free(targets);
+    for (size_t i = 0; i < nfull; i++)
+        free(full[i]);
+    for (size_t i = 0; i < nblocked; i++)
+        free(blocked[i]);
+    for (size_t i = 0; i < nallowed; i++)
+        free(allowed[i]);
+    free(full);
+    free(blocked);
+    free(allowed);
+}
+
+static void reset_state_locked(blocker *b)
+{
+    ban_state *st, *tmp;
+    HASH_ITER(hh, b->active, st, tmp)
+    {
+        HASH_DEL(b->active, st);
+        free(st);
+    }
+    port_ref *pr, *ptmp;
+    HASH_ITER(hh, b->ports, pr, ptmp)
+    {
+        HASH_DEL(b->ports, pr);
+        free(pr);
+    }
+    set_free(&b->full_banned);
+    set_free(&b->upnp_blocked);
+    set_free(&b->upnp_allowed);
+    b->upnp_all = false;
+}
+
+/* ------------------------------------------------------------------ */
+/* 生命周期                                                            */
+/* ------------------------------------------------------------------ */
+
+static void on_alert_start(void *ctx, const char *mac, const char *ip, uint16_t port,
+                           const char *proto)
+{
+    blocker *b = ctx;
+    block_event ev = {.ban = true, .port = port};
+    snprintf(ev.mac, sizeof(ev.mac), "%s", mac);
+    snprintf(ev.ip, sizeof(ev.ip), "%s", ip);
+    snprintf(ev.proto, sizeof(ev.proto), "%s", proto);
+    enqueue(b, &ev);
+}
+
+static void on_alert_end(void *ctx, const char *mac, const char *ip, uint16_t port,
+                         const char *proto)
+{
+    blocker *b = ctx;
+    block_event ev = {.ban = false, .port = port};
+    snprintf(ev.mac, sizeof(ev.mac), "%s", mac);
+    snprintf(ev.ip, sizeof(ev.ip), "%s", ip);
+    snprintf(ev.proto, sizeof(ev.proto), "%s", proto);
+    enqueue(b, &ev);
+}
+
+static const alert_sink g_sink = {.on_alert_start = on_alert_start,
+                                  .on_alert_end = on_alert_end};
+
+const alert_sink *blocker_alert_sink(blocker *b, void **ctx)
+{
+    if (ctx)
+        *ctx = b;
+    return &g_sink;
+}
+
+blocker *blocker_create(firewall *fw, bool hide, const blocker_fullban_cfg *fb,
+                        const blocker_upnp_cfg *up)
+{
+    blocker *b = xcalloc(1, sizeof(*b));
+    b->fw = fw;
+    b->hide = hide;
+    pthread_mutex_init(&b->qmu, NULL);
+    pthread_cond_init(&b->qcond, NULL);
+    pthread_mutex_init(&b->mu, NULL);
+    b->fb_threshold = 1;
+    if (fb && fb->enabled) {
+        b->fb_enabled = true;
+        snprintf(b->fb_mode, sizeof(b->fb_mode), "%s", fb->mode);
+        b->fb_threshold = fb->threshold > 0 ? fb->threshold : 1;
+        for (size_t i = 0; i < fb->ndevices; i++)
+            set_add(&b->fb_devices, fb->devices[i]);
+    }
+    if (up && up->enabled) {
+        b->up_enabled = true;
+        b->up_block_all = up->block_all;
+        for (size_t i = 0; i < up->ntargets; i++)
+            set_add(&b->up_targets, up->targets[i]);
+    }
+
+    apply_static_upnp(b);
+
+    b->worker_started = pthread_create(&b->worker, NULL, worker_main, b) == 0;
+    b->refresher_started = pthread_create(&b->refresher, NULL, refresh_main, b) == 0;
+    return b;
+}
+
+void blocker_close(blocker *b)
+{
+    if (!b)
+        return;
+    pthread_mutex_lock(&b->qmu);
+    if (b->closed) {
+        pthread_mutex_unlock(&b->qmu);
+        return;
+    }
+    b->closed = true;
+    b->stopping = true;
+    pthread_cond_broadcast(&b->qcond);
+    pthread_mutex_unlock(&b->qmu);
+
+    if (b->worker_started)
+        pthread_join(b->worker, NULL);
+    if (b->refresher_started)
+        pthread_join(b->refresher, NULL);
+    unban_all_rules(b);
+
+    pthread_mutex_lock(&b->mu);
+    reset_state_locked(b);
+    pthread_mutex_unlock(&b->mu);
+}
+
+void blocker_set_hide(blocker *b, bool hide)
+{
+    if (b)
+        b->hide = hide;
+}
+
+void blocker_free(blocker *b)
+{
+    if (!b)
+        return;
+    set_free(&b->full_banned);
+    set_free(&b->upnp_blocked);
+    set_free(&b->upnp_allowed);
+    set_free(&b->fb_devices);
+    set_free(&b->up_targets);
+    str_val *e, *tmp;
+    HASH_ITER(hh, b->dev_ip, e, tmp)
+    {
+        HASH_DEL(b->dev_ip, e);
+        free(e);
+    }
+    pthread_mutex_destroy(&b->qmu);
+    pthread_cond_destroy(&b->qcond);
+    pthread_mutex_destroy(&b->mu);
+    free(b);
+}
+
+/* ------------------------------------------------------------------ */
+/* 手动解封                                                            */
+/* ------------------------------------------------------------------ */
+
+void blocker_force_unban(blocker *b, const char *mac, uint16_t port, const char *proto,
+                         int *removed, char *err, size_t errlen)
+{
+    *removed = 0;
+    if (!b || !b->fw) {
+        set_err(err, errlen, "防火墙未启用");
+        return;
+    }
+    pcdn_mac m;
+    if (!mac_parse(mac, &m, err, errlen)) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "MAC 无效：\"%s\"", mac);
+        set_err(err, errlen, "%s", tmp);
+        return;
+    }
+    char macstr[32];
+    mac_format(&m, macstr, sizeof(macstr));
+
+    char p[8];
+    snprintf(p, sizeof(p), "%s", proto ? proto : "");
+    for (char *q = p; *q; q++)
+        *q = (char)tolower((unsigned char)*q);
+    if (strcmp(p, PROTO_UDP) != 0 && strcmp(p, PROTO_TCP) != 0) {
+        set_err(err, errlen, "proto 无效：\"%s\"（可选 udp / tcp）", proto ? proto : "");
+        return;
+    }
+
+    typedef struct {
+        char ip[64];
+        char proto[4];
+    } target;
+    target *targets = NULL;
+    size_t nt = 0;
+
+    pthread_mutex_lock(&b->mu);
+    ban_state *st, *tmp;
+    HASH_ITER(hh, b->active, st, tmp)
+    {
+        if (strcmp(st->mac, macstr) != 0 || st->port != port || strcmp(st->proto, p) != 0)
+            continue;
+        if (st->applied) {
+            targets = xrealloc(targets, (nt + 1) * sizeof(*targets));
+            snprintf(targets[nt].ip, sizeof(targets[nt].ip), "%s", state_ip(st));
+            snprintf(targets[nt].proto, sizeof(targets[nt].proto), "%s", st->proto);
+            nt++;
+        }
+        HASH_DEL(b->active, st);
+        free(st);
+        bump_port_locked(b, macstr, port, -1);
+        (*removed)++;
+    }
+    pthread_mutex_unlock(&b->mu);
+
+    char first_err[512] = {0};
+    for (size_t i = 0; i < nt; i++) {
+        char mb[64], ib[64], label[8];
+        fmt_masked(b->hide, macstr, targets[i].ip, mb, sizeof(mb), ib, sizeof(ib));
+        snprintf(label, sizeof(label), "%s", targets[i].proto);
+        for (char *q = label; *q; q++)
+            *q = (char)toupper((unsigned char)*q);
+        if (firewall_unban(b->fw, macstr, targets[i].ip, port, targets[i].proto) != 0) {
+            log_error("手动解封设备 %s 的 %s 端口 %d 失败", mb, label, port);
+            if (first_err[0] == '\0')
+                snprintf(first_err, sizeof(first_err), "防火墙命令执行失败");
+            continue;
+        }
+        log_info("已手动解封设备 %s 的 %s 端口 %d", mb, label, port);
+    }
+    free(targets);
+    maybe_full_ban(b, macstr, dev_ip_get(b, macstr));
+    if (first_err[0])
+        set_err(err, errlen, "%s", first_err);
+}
+
+/* ------------------------------------------------------------------ */
+/* 快照 / 索引                                                         */
+/* ------------------------------------------------------------------ */
+
+static int cmp_str_ptr(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static int cmp_ban_view(const void *pa, const void *pb)
+{
+    const ban_view *a = pa, *b = pb;
+    int c = strcmp(a->mac, b->mac);
+    if (c)
+        return c;
+    if (a->port != b->port)
+        return (int)a->port - (int)b->port;
+    return strcmp(a->proto, b->proto);
+}
+
+void blocker_snapshot_get(blocker *b, blocker_snapshot *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!b)
+        return;
+    pthread_mutex_lock(&b->mu);
+    size_t count = HASH_COUNT(b->active);
+    out->bans = count ? xcalloc(count, sizeof(ban_view)) : NULL;
+    out->nbans = 0;
+    for (ban_state *st = b->active; st; st = st->hh.next) {
+        ban_view *v = &out->bans[out->nbans++];
+        snprintf(v->mac, sizeof(v->mac), "%s", st->mac);
+        v->port = st->port;
+        snprintf(v->proto, sizeof(v->proto), "%s", st->proto);
+        snprintf(v->family, sizeof(v->family), "%s", fam_name(st->fam));
+        v->refs = state_total(st);
+        snprintf(v->ip, sizeof(v->ip), "%s", state_ip(st));
+        v->applied = st->applied;
+    }
+    set_keys(b->full_banned, &out->full_banned, &out->nfull);
+    set_keys(b->upnp_blocked, &out->upnp_blocked, &out->nupnp_blocked);
+    set_keys(b->upnp_allowed, &out->upnp_allowed, &out->nupnp_allowed);
+    out->upnp_all = b->upnp_all;
+    pthread_mutex_unlock(&b->mu);
+
+    if (out->nbans > 1)
+        qsort(out->bans, out->nbans, sizeof(ban_view), cmp_ban_view);
+    if (out->nfull > 1)
+        qsort(out->full_banned, out->nfull, sizeof(char *), cmp_str_ptr);
+    if (out->nupnp_blocked > 1)
+        qsort(out->upnp_blocked, out->nupnp_blocked, sizeof(char *), cmp_str_ptr);
+    if (out->nupnp_allowed > 1)
+        qsort(out->upnp_allowed, out->nupnp_allowed, sizeof(char *), cmp_str_ptr);
+}
+
+void blocker_snapshot_free(blocker_snapshot *s)
+{
+    if (!s)
+        return;
+    free(s->bans);
+    for (size_t i = 0; i < s->nfull; i++)
+        free(s->full_banned[i]);
+    for (size_t i = 0; i < s->nupnp_blocked; i++)
+        free(s->upnp_blocked[i]);
+    for (size_t i = 0; i < s->nupnp_allowed; i++)
+        free(s->upnp_allowed[i]);
+    free(s->full_banned);
+    free(s->upnp_blocked);
+    free(s->upnp_allowed);
+    memset(s, 0, sizeof(*s));
+}
+
+void blocker_counts_get(blocker *b, blocker_counts *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!b)
+        return;
+    pthread_mutex_lock(&b->mu);
+    out->active_bans = HASH_COUNT(b->active);
+    out->full_banned = HASH_COUNT(b->full_banned);
+    out->upnp_blocked = HASH_COUNT(b->upnp_blocked);
+    out->upnp_allowed = HASH_COUNT(b->upnp_allowed);
+    out->upnp_all = b->upnp_all;
+    pthread_mutex_unlock(&b->mu);
+}
+
+void blocker_ban_index_get(blocker *b, ban_index *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!b)
+        return;
+    pthread_mutex_lock(&b->mu);
+    out->both = b->fw ? firewall_ban_both(b->fw) : false;
+    size_t count = HASH_COUNT(b->active);
+    out->rules = count ? xcalloc(count, sizeof(ban_rule_view)) : NULL;
+    out->nrules = 0;
+    for (ban_state *st = b->active; st; st = st->hh.next) {
+        ban_rule_view *v = &out->rules[out->nrules++];
+        snprintf(v->mac, sizeof(v->mac), "%s", st->mac);
+        v->port = st->port;
+        snprintf(v->proto, sizeof(v->proto), "%s", st->proto);
+        if (out->both)
+            v->family[0] = '\0';
+        else
+            snprintf(v->family, sizeof(v->family), "%s", fam_name(st->fam));
+    }
+    set_keys(b->full_banned, &out->full, &out->nfull);
+    pthread_mutex_unlock(&b->mu);
+
+    if (b->fw) {
+        size_t n = 0;
+        const uint16_t *allow = firewall_fullban_allow_ports(b->fw, &n);
+        if (n > 0) {
+            out->allow = xmalloc(n * sizeof(uint16_t));
+            memcpy(out->allow, allow, n * sizeof(uint16_t));
+            out->nallow = n;
+        }
+    }
+}
+
+void ban_index_free(ban_index *ix)
+{
+    if (!ix)
+        return;
+    free(ix->rules);
+    for (size_t i = 0; i < ix->nfull; i++)
+        free(ix->full[i]);
+    free(ix->full);
+    free(ix->allow);
+    memset(ix, 0, sizeof(*ix));
+}
+
+bool ban_index_banned(const ban_index *ix, const char *mac, uint16_t port, const char *proto,
+                      bool v6)
+{
+    if (!ix)
+        return false;
+    for (size_t i = 0; i < ix->nfull; i++) {
+        if (strcmp(ix->full[i], mac) != 0)
+            continue;
+        if (strcmp(proto, PROTO_UDP) != 0)
+            break;
+        bool allowed = false;
+        for (size_t k = 0; k < ix->nallow; k++) {
+            if (ix->allow[k] == port) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed)
+            return true;
+        break;
+    }
+    const char *family = "";
+    if (!ix->both)
+        family = v6 ? "v6" : "v4";
+    for (size_t i = 0; i < ix->nrules; i++) {
+        const ban_rule_view *r = &ix->rules[i];
+        if (strcmp(r->mac, mac) == 0 && r->port == port && strcmp(r->proto, proto) == 0 &&
+            strcmp(r->family, family) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* 状态导出 / 恢复                                                     */
+/* ------------------------------------------------------------------ */
+
+static uint8_t family_to_u8(const char *f)
+{
+    if (strcmp(f, "v4") == 0)
+        return STATE_FAMILY_V4;
+    if (strcmp(f, "v6") == 0)
+        return STATE_FAMILY_V6;
+    return STATE_FAMILY_NONE;
+}
+
+static const char *u8_to_family(uint8_t f)
+{
+    if (f == STATE_FAMILY_V4)
+        return "v4";
+    if (f == STATE_FAMILY_V6)
+        return "v6";
+    return "";
+}
+
+static bool parse_addr_opt(const char *s, pcdn_ip *ip)
+{
+    memset(ip, 0, sizeof(*ip));
+    if (!s || !s[0])
+        return false;
+    char e[128];
+    return ip_parse(s, ip, e, sizeof(e));
+}
+
+bool blocker_block_state(blocker *b, state_file *out, char *err, size_t errlen)
+{
+    (void)err;
+    (void)errlen;
+    /* 只重置本函数负责的字段；saved_at / sessions 可能已由调用方填好 */
+    out->bans = NULL;
+    out->nbans = 0;
+    out->fullbanned = NULL;
+    out->nfull = 0;
+    out->upnp_blocked = NULL;
+    out->nupnp_blocked = 0;
+    out->upnp_allowed = NULL;
+    out->nupnp_allowed = 0;
+    out->upnp_all = false;
+    if (!b)
+        return true;
+    pthread_mutex_lock(&b->mu);
+    size_t cap = HASH_COUNT(b->active) * 2;
+    out->bans = cap ? xcalloc(cap, sizeof(state_ban)) : NULL;
+    for (ban_state *st = b->active; st; st = st->hh.next) {
+        pcdn_mac mac;
+        char e[128];
+        if (!mac_parse(st->mac, &mac, e, sizeof(e)))
+            continue;
+        for (int i = 0; i < 2; i++) {
+            if (st->refs[i] == 0)
+                continue;
+            state_ban *be = &out->bans[out->nbans++];
+            be->mac = mac;
+            be->port = st->port;
+            be->proto = strcmp(st->proto, PROTO_TCP) == 0 ? 6 : 17;
+            be->family = family_to_u8(fam_name(i));
+            parse_addr_opt(st->ips[i], &be->ip);
+            be->refs = (uint16_t)st->refs[i];
+            be->applied = st->applied;
+        }
+    }
+    out->fullbanned = HASH_COUNT(b->full_banned)
+                          ? xcalloc(HASH_COUNT(b->full_banned), sizeof(state_fullban))
+                          : NULL;
+    for (str_set *e = b->full_banned; e; e = e->hh.next) {
+        pcdn_mac mac;
+        char errbuf[128];
+        if (!mac_parse(e->key, &mac, errbuf, sizeof(errbuf)))
+            continue;
+        state_fullban *fe = &out->fullbanned[out->nfull++];
+        fe->mac = mac;
+        parse_addr_opt(dev_ip_get_nolock(b, e->key), &fe->ip);
+    }
+    size_t n = HASH_COUNT(b->upnp_blocked);
+    out->upnp_blocked = n ? xcalloc(n, sizeof(pcdn_mac)) : NULL;
+    for (str_set *e = b->upnp_blocked; e; e = e->hh.next) {
+        pcdn_mac mac;
+        char errbuf[128];
+        if (mac_parse(e->key, &mac, errbuf, sizeof(errbuf)))
+            out->upnp_blocked[out->nupnp_blocked++] = mac;
+    }
+    n = HASH_COUNT(b->upnp_allowed);
+    out->upnp_allowed = n ? xcalloc(n, sizeof(pcdn_mac)) : NULL;
+    for (str_set *e = b->upnp_allowed; e; e = e->hh.next) {
+        pcdn_mac mac;
+        char errbuf[128];
+        if (mac_parse(e->key, &mac, errbuf, sizeof(errbuf)))
+            out->upnp_allowed[out->nupnp_allowed++] = mac;
+    }
+    out->upnp_all = b->upnp_all;
+    pthread_mutex_unlock(&b->mu);
+    return true;
+}
+
+void blocker_restore(blocker *b, const state_file *st)
+{
+    if (!b || !st || !b->fw)
+        return;
+
+    /* 统计每个设备在状态文件里的端口数，决定是否恢复全端口封禁 */
+    str_set *mac_ports = NULL;
+    for (size_t i = 0; i < st->nbans; i++) {
+        char mac[18], key[32];
+        mac_format(&st->bans[i].mac, mac, sizeof(mac));
+        make_port_key(mac, st->bans[i].port, key, sizeof(key));
+        set_add(&mac_ports, key);
+    }
+    str_set *restore_full = NULL;
+    for (size_t i = 0; i < st->nfull; i++) {
+        char mac[18];
+        mac_format(&st->fullbanned[i].mac, mac, sizeof(mac));
+        int ports = 0;
+        for (str_set *e = mac_ports; e; e = e->hh.next) {
+            if (strncmp(e->key, mac, strlen(mac)) == 0 && e->key[strlen(mac)] == ':')
+                ports++;
+        }
+        if (fullban_applies(b, mac) && ports >= b->fb_threshold)
+            set_add(&restore_full, mac);
+    }
+
+    for (size_t i = 0; i < st->nbans; i++) {
+        const state_ban *e = &st->bans[i];
+        char mac[18], ip[64], proto[4], key[96];
+        mac_format(&e->mac, mac, sizeof(mac));
+        ip_format(&e->ip, ip, sizeof(ip));
+        snprintf(proto, sizeof(proto), "%s", e->proto == 6 ? PROTO_TCP : PROTO_UDP);
+        if (firewall_ban_both(b->fw))
+            snprintf(key, sizeof(key), "%s:%u:%s", mac, e->port, proto);
+        else
+            snprintf(key, sizeof(key), "%s:%u:%s:%s", mac, e->port, proto,
+                     firewall_addr_family(ip));
+        bool applied = e->applied;
+        if (!applied && strcmp(proto, PROTO_UDP) == 0 && !set_contains(restore_full, mac))
+            applied = true;
+        const char *family = u8_to_family(e->family);
+        if (family[0] == '\0')
+            family = firewall_addr_family(ip);
+        int i_fam = strcmp(family, "v6") == 0 ? 1 : 0;
+        unsigned refs = e->refs < 1 ? 1 : e->refs;
+
+        pthread_mutex_lock(&b->mu);
+        ban_state *existing = NULL;
+        HASH_FIND_STR(b->active, key, existing);
+        bool do_apply = false;
+        if (existing) {
+            existing->refs[i_fam] += refs;
+            snprintf(existing->ips[i_fam], sizeof(existing->ips[i_fam]), "%s", ip);
+            if (applied && !existing->applied) {
+                existing->applied = true;
+                do_apply = true;
+            }
+        } else {
+            ban_state *ns = xcalloc(1, sizeof(*ns));
+            snprintf(ns->key, sizeof(ns->key), "%s", key);
+            snprintf(ns->mac, sizeof(ns->mac), "%s", mac);
+            snprintf(ns->proto, sizeof(ns->proto), "%s", proto);
+            ns->port = e->port;
+            ns->fam = (uint8_t)i_fam;
+            ns->last = (uint8_t)i_fam;
+            ns->refs[i_fam] = refs;
+            snprintf(ns->ips[i_fam], sizeof(ns->ips[i_fam]), "%s", ip);
+            ns->applied = applied;
+            HASH_ADD_STR(b->active, key, ns);
+            bump_port_locked(b, mac, e->port, 1);
+            do_apply = applied;
+        }
+        pthread_mutex_unlock(&b->mu);
+
+        if (do_apply) {
+            if (firewall_ban(b->fw, mac, ip, e->port, proto) != 0) {
+                char mb[64], ib[64];
+                fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+                log_error("继承封禁设备 %s 的 %s 端口 %d 失败", mb, proto, e->port);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < st->nfull; i++) {
+        char mac[18], ip[64];
+        mac_format(&st->fullbanned[i].mac, mac, sizeof(mac));
+        ip_format(&st->fullbanned[i].ip, ip, sizeof(ip));
+        if (!set_contains(restore_full, mac))
+            continue;
+        pthread_mutex_lock(&b->mu);
+        bool already = set_contains(b->full_banned, mac);
+        if (!already)
+            set_add(&b->full_banned, mac);
+        pthread_mutex_unlock(&b->mu);
+        if (already)
+            continue;
+        if (firewall_full_ban(b->fw, mac, ip) != 0) {
+            char mb[64], ib[64];
+            fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+            log_error("继承全 UDP 端口封禁设备 %s 失败", mb);
+            pthread_mutex_lock(&b->mu);
+            set_del(&b->full_banned, mac);
+            pthread_mutex_unlock(&b->mu);
+        }
+    }
+
+    for (size_t i = 0; i < st->nupnp_blocked; i++) {
+        char mac[18];
+        mac_format(&st->upnp_blocked[i], mac, sizeof(mac));
+        apply_upnp_ban(b, true, mac);
+    }
+    for (size_t i = 0; i < st->nupnp_allowed; i++) {
+        char mac[18];
+        mac_format(&st->upnp_allowed[i], mac, sizeof(mac));
+        apply_upnp_allow(b, true, mac);
+    }
+    if (st->upnp_all) {
+        pthread_mutex_lock(&b->mu);
+        bool already = b->upnp_all;
+        pthread_mutex_unlock(&b->mu);
+        if (!already) {
+            if (firewall_upnp_block_all(b->fw) != 0) {
+                log_error("继承 UPnP 全量拦截失败");
+            } else {
+                pthread_mutex_lock(&b->mu);
+                b->upnp_all = true;
+                pthread_mutex_unlock(&b->mu);
+            }
+        }
+    }
+
+    set_free(&mac_ports);
+    set_free(&restore_full);
+}
+
+void blocker_adopt_sessions(blocker *b, const state_session *sessions, size_t n)
+{
+    if (!b || !b->fw || n == 0)
+        return;
+
+    typedef struct {
+        pcdn_mac mac;
+        uint16_t port;
+        uint8_t proto;
+        uint8_t family;
+        pcdn_ip ip;
+        uint16_t refs;
+    } adopt;
+    adopt *list = xcalloc(n, sizeof(adopt));
+    size_t nl = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t family = sessions[i].v6 ? STATE_FAMILY_V6 : STATE_FAMILY_V4;
+        size_t k;
+        for (k = 0; k < nl; k++) {
+            if (mac_equal(&list[k].mac, &sessions[i].mac) && list[k].port == sessions[i].port &&
+                list[k].proto == sessions[i].proto && list[k].family == family) {
+                list[k].refs++;
+                break;
+            }
+        }
+        if (k == nl) {
+            list[nl].mac = sessions[i].mac;
+            list[nl].port = sessions[i].port;
+            list[nl].proto = sessions[i].proto;
+            list[nl].family = family;
+            list[nl].ip = sessions[i].ip;
+            list[nl].refs = 1;
+            nl++;
+        }
+    }
+    state_file st;
+    memset(&st, 0, sizeof(st));
+    st.bans = xcalloc(nl ? nl : 1, sizeof(state_ban));
+    for (size_t i = 0; i < nl; i++) {
+        state_ban *be = &st.bans[st.nbans++];
+        be->mac = list[i].mac;
+        be->port = list[i].port;
+        be->proto = list[i].proto;
+        be->family = list[i].family;
+        be->ip = list[i].ip;
+        be->refs = list[i].refs;
+        be->applied = true;
+    }
+    blocker_restore(b, &st);
+
+    /* 补发后按设备重新评估全端口封禁 */
+    for (size_t i = 0; i < nl; i++) {
+        bool first = true;
+        for (size_t k = 0; k < i; k++) {
+            if (mac_equal(&list[k].mac, &list[i].mac)) {
+                first = false;
+                break;
+            }
+        }
+        if (!first)
+            continue;
+        char mac[18], ip[64];
+        mac_format(&list[i].mac, mac, sizeof(mac));
+        ip_format(&list[i].ip, ip, sizeof(ip));
+        maybe_full_ban(b, mac, ip);
+    }
+    free(st.bans);
+    free(list);
+}
