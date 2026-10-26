@@ -1,39 +1,51 @@
 #!/bin/sh
 # 构建并运行单元 / 集成测试
+# 从 make 调用时会继承 CC / CFLAGS / LDFLAGS，从而在 musl 静态构建下也验证同一套工具链。
 set -eu
 cd "$(dirname "$0")/.."
 
-make -s
+CC="${CC:-cc}"
+OBJ_DIR="${OBJ_DIR:-build/local}"
 
-CFLAGS="-std=c23 -O1 -g -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
+if [ -z "${CFLAGS:-}" ]; then
+    CFLAGS="-std=c23 -O1 -g -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
 -Ithird_party/tomlc99 -Ithird_party/uthash/include -Ithird_party/cJSON \
 -Ithird_party/picohttpparser"
+fi
+LDFLAGS="${LDFLAGS:-} -pthread"
 
-CORE_OBJS="build/config.o build/filter.o build/detector.o build/state.o build/firewall.o \
-build/util.o build/toml.o"
-FIREWALL_OBJS="build/config.o build/firewall.o build/filter.o build/util.o build/toml.o"
-BLOCKER_OBJS="build/blocker.o build/firewall.o build/config.o build/filter.o build/state.o \
-build/util.o build/toml.o"
-HTTP_OBJS="build/httpapi.o build/http.o build/blocker.o build/detector.o build/filter.o \
-build/config.o build/state.o build/firewall.o build/util.o build/toml.o build/cJSON.o \
-build/picohttpparser.o"
+# 直接运行时先构建主程序；由 `make test` 调用时产物已存在且已按正确模式链接，
+# 不再重复 make（否则会丢掉调用方传入的 LDFLAGS，例如 -static）。
+if [ ! -x bin/pcdn-detect ]; then
+    # shellcheck disable=SC2086
+    make -s CC="$CC" LDFLAGS="$LDFLAGS"
+fi
+
+CORE_OBJS="$OBJ_DIR/config.o $OBJ_DIR/filter.o $OBJ_DIR/detector.o $OBJ_DIR/state.o \
+$OBJ_DIR/firewall.o $OBJ_DIR/util.o $OBJ_DIR/toml.o"
+FIREWALL_OBJS="$OBJ_DIR/config.o $OBJ_DIR/firewall.o $OBJ_DIR/filter.o $OBJ_DIR/util.o $OBJ_DIR/toml.o"
+BLOCKER_OBJS="$OBJ_DIR/blocker.o $OBJ_DIR/firewall.o $OBJ_DIR/config.o $OBJ_DIR/filter.o \
+$OBJ_DIR/state.o $OBJ_DIR/util.o $OBJ_DIR/toml.o"
+HTTP_OBJS="$OBJ_DIR/httpapi.o $OBJ_DIR/http.o $OBJ_DIR/blocker.o $OBJ_DIR/detector.o \
+$OBJ_DIR/filter.o $OBJ_DIR/config.o $OBJ_DIR/state.o $OBJ_DIR/firewall.o $OBJ_DIR/util.o \
+$OBJ_DIR/toml.o $OBJ_DIR/cJSON.o $OBJ_DIR/picohttpparser.o"
 
 # shellcheck disable=SC2086
-cc $CFLAGS tests/test_core.c $CORE_OBJS -o build/test_core -pthread
+$CC $CFLAGS tests/test_core.c $CORE_OBJS -o $OBJ_DIR/test_core $LDFLAGS
 # shellcheck disable=SC2086
-cc $CFLAGS tests/test_http.c $HTTP_OBJS -o build/test_http -pthread
+$CC $CFLAGS tests/test_http.c $HTTP_OBJS -o $OBJ_DIR/test_http $LDFLAGS
 # shellcheck disable=SC2086
-cc $CFLAGS tests/test_firewall.c $FIREWALL_OBJS -o build/test_firewall -pthread
+$CC $CFLAGS tests/test_firewall.c $FIREWALL_OBJS -o $OBJ_DIR/test_firewall $LDFLAGS
 # shellcheck disable=SC2086
-cc $CFLAGS tests/test_blocker.c $BLOCKER_OBJS -o build/test_blocker -pthread
+$CC $CFLAGS tests/test_blocker.c $BLOCKER_OBJS -o $OBJ_DIR/test_blocker $LDFLAGS
 # shellcheck disable=SC2086
-cc $CFLAGS tests/test_firewall_backends.c $FIREWALL_OBJS -o build/test_fw_backends -pthread
+$CC $CFLAGS tests/test_firewall_backends.c $FIREWALL_OBJS -o $OBJ_DIR/test_fw_backends $LDFLAGS
 
-./build/test_core
-./build/test_firewall
-./build/test_blocker
-./build/test_fw_backends
-./build/test_http
+./$OBJ_DIR/test_core
+./$OBJ_DIR/test_firewall
+./$OBJ_DIR/test_blocker
+./$OBJ_DIR/test_fw_backends
+./$OBJ_DIR/test_http
 
 # CLI 冒烟测试
 ./bin/pcdn-detect --version | grep -q '0.0.1-beta.1+'
