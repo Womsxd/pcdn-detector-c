@@ -101,6 +101,11 @@ CFLAGS  += -std=c23 -Wall -Wextra -Wno-unused-parameter -Wshadow -Wformat=2 \
            -Ithird_party/picohttpparser $(KERNEL_INC)
 LDFLAGS += -pthread
 
+# 函数 / 数据各自独立成 section，配合链接期 --gc-sections 剔除未被引用的代码与数据，
+# 缩小全静态二进制体积。ctor/dtor 数组由链接脚本 KEEP，不受影响。
+CFLAGS  += -ffunction-sections -fdata-sections
+LDFLAGS += -Wl,--gc-sections
+
 # PIE 默认开启（与链接方式无关）：动态链接用 -pie，静态链接用 -static-pie，
 # 编译侧配套 -fPIE。PIE=0 时显式关闭，产出固定加载地址的可执行文件。
 ifeq ($(filter 1,$(PIE)),1)
