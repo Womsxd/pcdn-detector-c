@@ -1,6 +1,10 @@
 /* HTTP API 集成测试：启动真实监听并用 curl 验证鉴权 / CORS / 路由 */
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "config.h"
@@ -71,6 +75,40 @@ static int run_curl(const char *args, char *body, size_t bodycap, char *headers,
     unlink(headpath);
     unlink(codepath);
     return 0;
+}
+
+/* 直接走 socket 发原始请求：curl 的命令行缓冲放不下 8 KiB 以上的请求头 */
+static int raw_request(const char *req, size_t len)
+{
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(18081);
+    if (inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr) != 1)
+        return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return -1;
+    }
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = send(fd, req + off, len - off, MSG_NOSIGNAL);
+        if (w <= 0)
+            break;
+        off += (size_t)w;
+    }
+    char resp[256] = {0};
+    ssize_t n = recv(fd, resp, sizeof(resp) - 1, 0);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    int code = 0;
+    if (sscanf(resp, "HTTP/1.1 %d", &code) != 1)
+        return -1;
+    return code;
 }
 
 int main(void)
@@ -232,6 +270,25 @@ int main(void)
              body, sizeof(body), headers, sizeof(headers), &status);
     CHECK(status == 204);
     CHECK(strstr(headers, "Access-Control-Allow-Origin") == NULL);
+
+    /* 请求头缓冲按需增长：8 KiB 头必须仍被接受（上限 16 KiB，与 Go 版一致） */
+    {
+        const char *head =
+            "GET /api/v1/health HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer secret\r\nX-Big: ";
+        const char *tail = "\r\nConnection: close\r\n\r\n";
+        size_t hlen = strlen(head), tlen = strlen(tail);
+        size_t pads[] = {8000, 17000};
+        int want[] = {200, 431};
+        for (size_t i = 0; i < sizeof(pads) / sizeof(pads[0]); i++) {
+            size_t total = hlen + pads[i] + tlen;
+            char *req = xmalloc(total);
+            memcpy(req, head, hlen);
+            memset(req + hlen, 'a', pads[i]);
+            memcpy(req + hlen + pads[i], tail, tlen);
+            CHECK(raw_request(req, total) == want[i]);
+            free(req);
+        }
+    }
 
     httpapi_stop(api);
     httpapi_free(api);

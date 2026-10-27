@@ -13,7 +13,8 @@
 #include "picohttpparser.h"
 #include "util.h"
 
-#define MAX_HEADER 16384
+#define MAX_HEADER 16384      /* 与 Go 版 minihttp 的 MaxHeaderBytes 默认值一致 */
+#define HEADER_BUF_INIT 2048  /* 每连接初始缓冲，读满后翻倍到 MAX_HEADER */
 #define MAX_BODY (1024 * 1024)
 #define MAX_REQUEST_LINE 4096
 #define HEADER_TIMEOUT_MS 5000
@@ -424,7 +425,9 @@ static void *conn_main(void *arg)
     struct timeval snd_tv = {.tv_sec = 10, .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
-    char *buf = xmalloc(MAX_HEADER + 1);
+    /* 按需增长：常规请求只占 HEADER_BUF_INIT，上限仍是 MAX_HEADER（与 Go 版一致） */
+    size_t cap = HEADER_BUF_INIT;
+    char *buf = xmalloc(cap + 1);
     bool first = true;
     for (;;) {
         if (atomic_load(&s->stopping))
@@ -439,11 +442,18 @@ static void *conn_main(void *arg)
         int64_t deadline = mono_ms() + (first ? HEADER_TIMEOUT_MS : IDLE_TIMEOUT_MS);
 
         while (pret == -2) {
-            if (len >= MAX_HEADER) {
-                send_simple_error(fd, 431, "请求头过大", true);
-                goto done;
+            if (len == cap) {
+                if (cap >= MAX_HEADER) {
+                    send_simple_error(fd, 431, "请求头过大", true);
+                    goto done;
+                }
+                size_t next = cap * 2;
+                if (next > MAX_HEADER)
+                    next = MAX_HEADER;
+                buf = xrealloc(buf, next + 1);
+                cap = next;
             }
-            ssize_t n = read_deadline(fd, buf + len, MAX_HEADER - len, deadline);
+            ssize_t n = read_deadline(fd, buf + len, cap - len, deadline);
             if (n == -2) {
                 if (len == 0)
                     goto done;
