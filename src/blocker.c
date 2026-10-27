@@ -10,13 +10,17 @@
 #define QUEUE_CAP 256
 #define PROTO_UDP "udp"
 #define PROTO_TCP "tcp"
+#define PROTO_UDP_ID 17
+#define PROTO_TCP_ID 6
 
+/* 队列元素只存二进制地址：256 项 × 28B = 7KiB（原来是 × 90B ≈ 23KiB）。
+ * 出队后再格式化回字符串，代价是每条事件一次 mac_format / ip_format。 */
 typedef struct {
-    bool ban;
-    char mac[18];
-    char ip[64];
+    pcdn_mac mac;
     uint16_t port;
-    char proto[4];
+    pcdn_ip ip;
+    uint8_t proto; /* PROTO_UDP_ID / PROTO_TCP_ID */
+    bool ban;
 } block_event;
 
 typedef struct ban_state {
@@ -210,6 +214,11 @@ static int fam_idx(const char *ip)
 static const char *fam_name(int idx)
 {
     return idx == 1 ? "v6" : "v4";
+}
+
+static const char *proto_name(uint8_t proto)
+{
+    return proto == PROTO_TCP_ID ? PROTO_TCP : PROTO_UDP;
 }
 
 static int state_total(const ban_state *st)
@@ -475,8 +484,10 @@ static void enqueue(blocker *b, const block_event *ev)
     pthread_mutex_lock(&b->qmu);
     if (b->qcount >= QUEUE_CAP) {
         pthread_mutex_unlock(&b->qmu);
-        char mb[64], ib[64];
-        fmt_masked(atomic_load(&b->hide), ev->mac, ev->ip, mb, sizeof(mb), ib, sizeof(ib));
+        char macstr[18], ipstr[64], mb[64], ib[64];
+        mac_format(&ev->mac, macstr, sizeof(macstr));
+        ip_format(&ev->ip, ipstr, sizeof(ipstr));
+        fmt_masked(atomic_load(&b->hide), macstr, ipstr, mb, sizeof(mb), ib, sizeof(ib));
         log_warn("警告：封禁事件队列已满，丢弃 %s:%u 的事件", mb, ev->port);
         return;
     }
@@ -489,42 +500,46 @@ static void enqueue(blocker *b, const block_event *ev)
 
 static void handle_event(blocker *b, const block_event *ev)
 {
+    char macstr[18], ipstr[64];
+    mac_format(&ev->mac, macstr, sizeof(macstr));
+    ip_format(&ev->ip, ipstr, sizeof(ipstr));
+    const char *ev_proto = proto_name(ev->proto);
+
     char key[96];
     if (firewall_ban_both(b->fw))
-        snprintf(key, sizeof(key), "%s:%u:%s", ev->mac, ev->port, ev->proto);
+        snprintf(key, sizeof(key), "%s:%u:%s", macstr, ev->port, ev_proto);
     else
-        snprintf(key, sizeof(key), "%s:%u:%s:%s", ev->mac, ev->port, ev->proto,
-                 firewall_addr_family(ev->ip));
+        snprintf(key, sizeof(key), "%s:%u:%s:%s", macstr, ev->port, ev_proto,
+                 firewall_addr_family(ipstr));
 
     pthread_mutex_lock(&b->mu);
     ban_state *st = NULL;
     HASH_FIND_STR(b->active, key, st);
     if (ev->ban) {
-        int i = fam_idx(ev->ip);
+        int i = fam_idx(ipstr);
         if (!st) {
             st = xcalloc(1, sizeof(*st));
             snprintf(st->key, sizeof(st->key), "%s", key);
-            snprintf(st->mac, sizeof(st->mac), "%s", ev->mac);
-            snprintf(st->proto, sizeof(st->proto), "%s", ev->proto);
+            snprintf(st->mac, sizeof(st->mac), "%s", macstr);
+            snprintf(st->proto, sizeof(st->proto), "%s", ev_proto);
             st->port = ev->port;
             st->fam = (uint8_t)i;
             HASH_ADD_STR(b->active, key, st);
-            bump_port_locked(b, ev->mac, ev->port, 1);
+            bump_port_locked(b, macstr, ev->port, 1);
         }
         st->refs[i]++;
-        snprintf(st->ips[i], sizeof(st->ips[i]), "%s", ev->ip);
+        snprintf(st->ips[i], sizeof(st->ips[i]), "%s", ipstr);
         st->last = (uint8_t)i;
-        dev_ip_set(b, ev->mac, ev->ip);
+        dev_ip_set(b, macstr, ipstr);
         bool first = state_total(st) == 1;
-        bool full = strcmp(ev->proto, PROTO_UDP) == 0 &&
-                    set_contains(b->full_banned, ev->mac);
+        bool full = ev->proto == PROTO_UDP_ID && set_contains(b->full_banned, macstr);
         if (first)
             st->applied = !full;
         pthread_mutex_unlock(&b->mu);
 
         if (first && !full)
-            apply_one(b, true, ev->mac, ev->ip, ev->port, ev->proto);
-        maybe_full_ban(b, ev->mac, ev->ip);
+            apply_one(b, true, macstr, ipstr, ev->port, ev_proto);
+        maybe_full_ban(b, macstr, ipstr);
         return;
     }
 
@@ -532,26 +547,26 @@ static void handle_event(blocker *b, const block_event *ev)
         pthread_mutex_unlock(&b->mu);
         return;
     }
-    int i = fam_idx(ev->ip);
+    int i = fam_idx(ipstr);
     if (st->refs[i] > 0)
         st->refs[i]--;
     else if (st->refs[1 - i] > 0)
         st->refs[1 - i]--;
     bool last = state_total(st) <= 0;
-    char ip[64], proto[4];
+    char st_ip[64], st_proto[4];
     bool applied = st->applied;
-    snprintf(ip, sizeof(ip), "%s", state_ip(st));
-    snprintf(proto, sizeof(proto), "%s", st->proto);
+    snprintf(st_ip, sizeof(st_ip), "%s", state_ip(st));
+    snprintf(st_proto, sizeof(st_proto), "%s", st->proto);
     if (last) {
         HASH_DEL(b->active, st);
         free(st);
-        bump_port_locked(b, ev->mac, ev->port, -1);
+        bump_port_locked(b, macstr, ev->port, -1);
     }
     pthread_mutex_unlock(&b->mu);
 
     if (last && applied)
-        apply_one(b, false, ev->mac, ip, ev->port, proto);
-    maybe_full_ban(b, ev->mac, ev->ip);
+        apply_one(b, false, macstr, st_ip, ev->port, st_proto);
+    maybe_full_ban(b, macstr, ipstr);
 }
 
 static void *worker_main(void *arg)
@@ -769,26 +784,35 @@ static void reset_state_locked(blocker *b)
 /* 生命周期                                                            */
 /* ------------------------------------------------------------------ */
 
+static bool event_from_strings(block_event *ev, bool ban, const char *mac, const char *ip,
+                               uint16_t port, const char *proto)
+{
+    char err[128];
+    memset(ev, 0, sizeof(*ev));
+    ev->ban = ban;
+    ev->port = port;
+    if (!mac_parse(mac, &ev->mac, err, sizeof(err)))
+        return false; /* 上游始终传格式化后的 MAC，解析失败说明数据异常，丢弃事件 */
+    /* 空串 / 无效地址保持 valid=false，出队时格式化回空串，与原行为一致 */
+    (void)ip_parse(ip, &ev->ip, err, sizeof(err));
+    ev->proto = (proto && strcmp(proto, PROTO_TCP) == 0) ? PROTO_TCP_ID : PROTO_UDP_ID;
+    return true;
+}
+
 static void on_alert_start(void *ctx, const char *mac, const char *ip, uint16_t port,
                            const char *proto)
 {
-    blocker *b = ctx;
-    block_event ev = {.ban = true, .port = port};
-    snprintf(ev.mac, sizeof(ev.mac), "%s", mac);
-    snprintf(ev.ip, sizeof(ev.ip), "%s", ip);
-    snprintf(ev.proto, sizeof(ev.proto), "%s", proto);
-    enqueue(b, &ev);
+    block_event ev;
+    if (event_from_strings(&ev, true, mac, ip, port, proto))
+        enqueue(ctx, &ev);
 }
 
 static void on_alert_end(void *ctx, const char *mac, const char *ip, uint16_t port,
                          const char *proto)
 {
-    blocker *b = ctx;
-    block_event ev = {.ban = false, .port = port};
-    snprintf(ev.mac, sizeof(ev.mac), "%s", mac);
-    snprintf(ev.ip, sizeof(ev.ip), "%s", ip);
-    snprintf(ev.proto, sizeof(ev.proto), "%s", proto);
-    enqueue(b, &ev);
+    block_event ev;
+    if (event_from_strings(&ev, false, mac, ip, port, proto))
+        enqueue(ctx, &ev);
 }
 
 static const alert_sink g_sink = {.on_alert_start = on_alert_start,
