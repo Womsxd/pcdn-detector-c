@@ -51,8 +51,13 @@ char *xstrdup(const char *s)
     return p;
 }
 
+/* 前置条件：s 至少有 n 字节可读（由调用方保证）；s 为 NULL 时返回 NULL */
 char *xstrndup(const char *s, size_t n)
 {
+    if (!s)
+        return NULL;
+    if (n == SIZE_MAX)
+        log_fatal("字符串长度溢出（%zu 字节）", n);
     char *p = xmalloc(n + 1);
     memcpy(p, s, n);
     p[n] = '\0';
