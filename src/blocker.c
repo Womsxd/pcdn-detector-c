@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include "uthash.h"
 #include "util.h"
@@ -52,7 +53,7 @@ typedef struct {
 
 struct blocker {
     firewall *fw;
-    bool hide;
+    atomic_bool hide; /* 热更新线程写，worker 线程读 */
 
     pthread_t worker;
     bool worker_started;
@@ -266,7 +267,7 @@ static void apply_one(blocker *b, bool ban, const char *mac, const char *ip, uin
                       const char *proto)
 {
     char mb[64], ib[64];
-    fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+    fmt_masked(atomic_load(&b->hide), mac, ip, mb, sizeof(mb), ib, sizeof(ib));
     char label[8];
     snprintf(label, sizeof(label), "%s", proto);
     for (char *p = label; *p; p++)
@@ -319,7 +320,7 @@ static bool fullban_applies(blocker *b, const char *mac)
 static void apply_full(blocker *b, bool ban, const char *mac, const char *ip)
 {
     char mb[64], ib[64];
-    fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+    fmt_masked(atomic_load(&b->hide), mac, ip, mb, sizeof(mb), ib, sizeof(ib));
     if (ban) {
         if (firewall_full_ban(b->fw, mac, ip) != 0) {
             log_error("对设备 %s 执行全 UDP 端口封禁失败", mb);
@@ -386,7 +387,7 @@ static bool apply_upnp_ban(blocker *b, bool ban, const char *mac)
 
     char mb[64], ib[64], ip[64];
     dev_ip_copy(b, mac, ip, sizeof(ip));
-    fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+    fmt_masked(atomic_load(&b->hide), mac, ip, mb, sizeof(mb), ib, sizeof(ib));
     if (ban) {
         if (firewall_upnp_ban(b->fw, mac, ip) != 0) {
             log_error("拦截设备 %s 的 UPnP 请求失败", mb);
@@ -421,7 +422,7 @@ static bool apply_upnp_allow(blocker *b, bool allow, const char *mac)
 
     char mb[64], ib[64], ip[64];
     dev_ip_copy(b, mac, ip, sizeof(ip));
-    fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+    fmt_masked(atomic_load(&b->hide), mac, ip, mb, sizeof(mb), ib, sizeof(ib));
     if (allow) {
         if (firewall_upnp_allow(b->fw, mac, ip) != 0) {
             log_error("放行设备 %s 的 UPnP 请求失败", mb);
@@ -475,7 +476,7 @@ static void enqueue(blocker *b, const block_event *ev)
     if (b->qcount >= QUEUE_CAP) {
         pthread_mutex_unlock(&b->qmu);
         char mb[64], ib[64];
-        fmt_masked(b->hide, ev->mac, ev->ip, mb, sizeof(mb), ib, sizeof(ib));
+        fmt_masked(atomic_load(&b->hide), ev->mac, ev->ip, mb, sizeof(mb), ib, sizeof(ib));
         log_warn("警告：封禁事件队列已满，丢弃 %s:%u 的事件", mb, ev->port);
         return;
     }
@@ -685,7 +686,7 @@ static void unban_all_rules(blocker *b)
 
     for (size_t i = 0; i < nt; i++) {
         char mb[64], ib[64], label[8];
-        fmt_masked(b->hide, targets[i].mac, targets[i].ip, mb, sizeof(mb), ib, sizeof(ib));
+        fmt_masked(atomic_load(&b->hide), targets[i].mac, targets[i].ip, mb, sizeof(mb), ib, sizeof(ib));
         snprintf(label, sizeof(label), "%s", targets[i].proto);
         for (char *p = label; *p; p++)
             *p = (char)toupper((unsigned char)*p);
@@ -699,7 +700,7 @@ static void unban_all_rules(blocker *b)
     for (size_t i = 0; i < nfull; i++) {
         char mb[64], ib[64], ip[64];
         dev_ip_copy(b, full[i], ip, sizeof(ip));
-        fmt_masked(b->hide, full[i], ip, mb, sizeof(mb), ib, sizeof(ib));
+        fmt_masked(atomic_load(&b->hide), full[i], ip, mb, sizeof(mb), ib, sizeof(ib));
         if (firewall_full_unban(b->fw, full[i], ip) != 0) {
             log_error("解除设备 %s 的全 UDP 端口封禁失败", mb);
             continue;
@@ -709,7 +710,7 @@ static void unban_all_rules(blocker *b)
     for (size_t i = 0; i < nblocked; i++) {
         char mb[64], ib[64], ip[64];
         dev_ip_copy(b, blocked[i], ip, sizeof(ip));
-        fmt_masked(b->hide, blocked[i], ip, mb, sizeof(mb), ib, sizeof(ib));
+        fmt_masked(atomic_load(&b->hide), blocked[i], ip, mb, sizeof(mb), ib, sizeof(ib));
         if (firewall_upnp_unban(b->fw, blocked[i], ip) != 0) {
             log_error("解除设备 %s 的 UPnP 拦截失败", mb);
             continue;
@@ -719,7 +720,7 @@ static void unban_all_rules(blocker *b)
     for (size_t i = 0; i < nallowed; i++) {
         char mb[64], ib[64], ip[64];
         dev_ip_copy(b, allowed[i], ip, sizeof(ip));
-        fmt_masked(b->hide, allowed[i], ip, mb, sizeof(mb), ib, sizeof(ib));
+        fmt_masked(atomic_load(&b->hide), allowed[i], ip, mb, sizeof(mb), ib, sizeof(ib));
         if (firewall_upnp_disallow(b->fw, allowed[i], ip) != 0) {
             log_error("取消设备 %s 的 UPnP 放行失败", mb);
             continue;
@@ -805,7 +806,7 @@ blocker *blocker_create(firewall *fw, bool hide, const blocker_fullban_cfg *fb,
 {
     blocker *b = xcalloc(1, sizeof(*b));
     b->fw = fw;
-    b->hide = hide;
+    atomic_init(&b->hide, hide);
     pthread_mutex_init(&b->qmu, NULL);
     pthread_cond_init(&b->qcond, NULL);
     pthread_mutex_init(&b->mu, NULL);
@@ -859,7 +860,7 @@ void blocker_close(blocker *b)
 void blocker_set_hide(blocker *b, bool hide)
 {
     if (b)
-        b->hide = hide;
+        atomic_store(&b->hide, hide);
 }
 
 void blocker_free(blocker *b)
@@ -943,7 +944,7 @@ void blocker_force_unban(blocker *b, const char *mac, uint16_t port, const char 
     char first_err[512] = {0};
     for (size_t i = 0; i < nt; i++) {
         char mb[64], ib[64], label[8];
-        fmt_masked(b->hide, macstr, targets[i].ip, mb, sizeof(mb), ib, sizeof(ib));
+        fmt_masked(atomic_load(&b->hide), macstr, targets[i].ip, mb, sizeof(mb), ib, sizeof(ib));
         snprintf(label, sizeof(label), "%s", targets[i].proto);
         for (char *q = label; *q; q++)
             *q = (char)toupper((unsigned char)*q);
@@ -1306,7 +1307,7 @@ void blocker_restore(blocker *b, const state_file *st)
         if (do_apply) {
             if (firewall_ban(b->fw, mac, ip, e->port, proto) != 0) {
                 char mb[64], ib[64];
-                fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+                fmt_masked(atomic_load(&b->hide), mac, ip, mb, sizeof(mb), ib, sizeof(ib));
                 log_error("继承封禁设备 %s 的 %s 端口 %d 失败", mb, proto, e->port);
             }
         }
@@ -1327,7 +1328,7 @@ void blocker_restore(blocker *b, const state_file *st)
             continue;
         if (firewall_full_ban(b->fw, mac, ip) != 0) {
             char mb[64], ib[64];
-            fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
+            fmt_masked(atomic_load(&b->hide), mac, ip, mb, sizeof(mb), ib, sizeof(ib));
             log_error("继承全 UDP 端口封禁设备 %s 失败", mb);
             pthread_mutex_lock(&b->mu);
             set_del(&b->full_banned, mac);
