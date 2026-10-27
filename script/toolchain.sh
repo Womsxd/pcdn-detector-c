@@ -64,7 +64,8 @@ fetch() {   # fetch <url> <dest>
 
 # 把 latest 解析成真实 tag：优先 GitHub API，失败时跟随 releases/latest 的跳转。
 resolve_tag() {
-    [ -n "$_TAG" ] && { echo "$_TAG"; return 0; }
+    # 可能被 gcc-static.sh 等脚本在 set -u 下 source，未初始化时不能用 $_TAG
+    [ -n "${_TAG:-}" ] && { echo "$_TAG"; return 0; }
     [ "$TOOLCHAIN_TAG" = latest ] || { echo "$TOOLCHAIN_TAG"; return 0; }
 
     _hit=
@@ -103,7 +104,7 @@ resolve_tag() {
 # SHA256SUMS 按 tag 缓存，拿不到就只提示、不中断
 load_sums() {   # <tag>
     [ "$NO_VERIFY" = 0 ] || return 0
-    [ -n "$_SUMS_TAG" ] && [ "$_SUMS_TAG" = "$1" ] && return 0
+    [ -n "${_SUMS_TAG:-}" ] && [ "$_SUMS_TAG" = "$1" ] && return 0
     SUMS="$CACHE/SHA256SUMS-$1"
     if [ ! -s "$SUMS" ]; then
         if fetch "$TOOLCHAIN_BASE_URL/$1/SHA256SUMS" "$SUMS" >/dev/null 2>&1; then

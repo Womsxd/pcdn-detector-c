@@ -104,7 +104,8 @@ resolve_target() {   # <latest|master|版本号> <plat>
     _plat=$2
     mkdir -p "$ZIG_CACHE"
     if [ ! -s "$ZIG_CACHE/index.json" ]; then
-        log "获取官方索引：$INDEX_URL"
+        # 本函数的 stdout 会被 $(...) 捕获成 "<tarball> <shasum>"，日志必须走 stderr
+        log "获取官方索引：$INDEX_URL" >&2
         fetch "$INDEX_URL" "$ZIG_CACHE/index.json" >/dev/null 2>&1 \
             || { warn "无法获取 index.json（网络受限？）"; rm -f "$ZIG_CACHE/index.json"; }
     fi
