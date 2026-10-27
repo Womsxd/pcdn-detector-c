@@ -150,14 +150,16 @@ static const char *dev_ip_get_nolock(blocker *b, const char *mac)
     return e ? e->val : "";
 }
 
-static const char *dev_ip_get(blocker *b, const char *mac)
+/* 内部缓冲会被 worker 线程并发改写，必须在锁内拷贝到调用方缓冲后再使用 */
+static void dev_ip_copy(blocker *b, const char *mac, char *out, size_t cap)
 {
+    if (!out || cap == 0)
+        return;
     pthread_mutex_lock(&b->mu);
     str_val *e = NULL;
     HASH_FIND_STR(b->dev_ip, mac, e);
-    const char *ret = e ? e->val : "";
+    snprintf(out, cap, "%s", e ? e->val : "");
     pthread_mutex_unlock(&b->mu);
-    return ret;
 }
 
 static void dev_ip_set(blocker *b, const char *mac, const char *ip)
@@ -382,10 +384,11 @@ static bool apply_upnp_ban(blocker *b, bool ban, const char *mac)
     if (ban == already)
         return false;
 
-    char mb[64], ib[64];
-    fmt_masked(b->hide, mac, dev_ip_get(b, mac), mb, sizeof(mb), ib, sizeof(ib));
+    char mb[64], ib[64], ip[64];
+    dev_ip_copy(b, mac, ip, sizeof(ip));
+    fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
     if (ban) {
-        if (firewall_upnp_ban(b->fw, mac, dev_ip_get(b, mac)) != 0) {
+        if (firewall_upnp_ban(b->fw, mac, ip) != 0) {
             log_error("拦截设备 %s 的 UPnP 请求失败", mb);
             return false;
         }
@@ -395,7 +398,7 @@ static bool apply_upnp_ban(blocker *b, bool ban, const char *mac)
         log_info("已拦截设备 %s 的 UPnP 请求", mb);
         return true;
     }
-    if (firewall_upnp_unban(b->fw, mac, dev_ip_get(b, mac)) != 0) {
+    if (firewall_upnp_unban(b->fw, mac, ip) != 0) {
         log_error("解除设备 %s 的 UPnP 拦截失败", mb);
         return false;
     }
@@ -416,10 +419,11 @@ static bool apply_upnp_allow(blocker *b, bool allow, const char *mac)
     if (allow == already)
         return false;
 
-    char mb[64], ib[64];
-    fmt_masked(b->hide, mac, dev_ip_get(b, mac), mb, sizeof(mb), ib, sizeof(ib));
+    char mb[64], ib[64], ip[64];
+    dev_ip_copy(b, mac, ip, sizeof(ip));
+    fmt_masked(b->hide, mac, ip, mb, sizeof(mb), ib, sizeof(ib));
     if (allow) {
-        if (firewall_upnp_allow(b->fw, mac, dev_ip_get(b, mac)) != 0) {
+        if (firewall_upnp_allow(b->fw, mac, ip) != 0) {
             log_error("放行设备 %s 的 UPnP 请求失败", mb);
             return false;
         }
@@ -429,7 +433,7 @@ static bool apply_upnp_allow(blocker *b, bool allow, const char *mac)
         log_info("已放行设备 %s 的 UPnP 请求", mb);
         return true;
     }
-    if (firewall_upnp_disallow(b->fw, mac, dev_ip_get(b, mac)) != 0) {
+    if (firewall_upnp_disallow(b->fw, mac, ip) != 0) {
         log_error("取消设备 %s 的 UPnP 放行失败", mb);
         return false;
     }
@@ -693,29 +697,30 @@ static void unban_all_rules(blocker *b)
         log_info("已解封设备 %s(%s) 的 %s 端口 %d", mb, ib, label, targets[i].port);
     }
     for (size_t i = 0; i < nfull; i++) {
-        char mb[64], ib[64];
-        fmt_masked(b->hide, full[i], dev_ip_get(b, full[i]), mb, sizeof(mb), ib, sizeof(ib));
-        if (firewall_full_unban(b->fw, full[i], dev_ip_get(b, full[i])) != 0) {
+        char mb[64], ib[64], ip[64];
+        dev_ip_copy(b, full[i], ip, sizeof(ip));
+        fmt_masked(b->hide, full[i], ip, mb, sizeof(mb), ib, sizeof(ib));
+        if (firewall_full_unban(b->fw, full[i], ip) != 0) {
             log_error("解除设备 %s 的全 UDP 端口封禁失败", mb);
             continue;
         }
         log_info("已解除设备 %s 的全 UDP 端口封禁", mb);
     }
     for (size_t i = 0; i < nblocked; i++) {
-        char mb[64], ib[64];
-        fmt_masked(b->hide, blocked[i], dev_ip_get(b, blocked[i]), mb, sizeof(mb), ib,
-                   sizeof(ib));
-        if (firewall_upnp_unban(b->fw, blocked[i], dev_ip_get(b, blocked[i])) != 0) {
+        char mb[64], ib[64], ip[64];
+        dev_ip_copy(b, blocked[i], ip, sizeof(ip));
+        fmt_masked(b->hide, blocked[i], ip, mb, sizeof(mb), ib, sizeof(ib));
+        if (firewall_upnp_unban(b->fw, blocked[i], ip) != 0) {
             log_error("解除设备 %s 的 UPnP 拦截失败", mb);
             continue;
         }
         log_info("已解除设备 %s 的 UPnP 拦截", mb);
     }
     for (size_t i = 0; i < nallowed; i++) {
-        char mb[64], ib[64];
-        fmt_masked(b->hide, allowed[i], dev_ip_get(b, allowed[i]), mb, sizeof(mb), ib,
-                   sizeof(ib));
-        if (firewall_upnp_disallow(b->fw, allowed[i], dev_ip_get(b, allowed[i])) != 0) {
+        char mb[64], ib[64], ip[64];
+        dev_ip_copy(b, allowed[i], ip, sizeof(ip));
+        fmt_masked(b->hide, allowed[i], ip, mb, sizeof(mb), ib, sizeof(ib));
+        if (firewall_upnp_disallow(b->fw, allowed[i], ip) != 0) {
             log_error("取消设备 %s 的 UPnP 放行失败", mb);
             continue;
         }
@@ -951,7 +956,9 @@ void blocker_force_unban(blocker *b, const char *mac, uint16_t port, const char 
         log_info("已手动解封设备 %s 的 %s 端口 %d", mb, label, port);
     }
     free(targets);
-    maybe_full_ban(b, macstr, dev_ip_get(b, macstr));
+    char cur_ip[64];
+    dev_ip_copy(b, macstr, cur_ip, sizeof(cur_ip));
+    maybe_full_ban(b, macstr, cur_ip);
     if (first_err[0])
         set_err(err, errlen, "%s", first_err);
 }
