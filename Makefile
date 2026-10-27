@@ -21,6 +21,10 @@
 #   STATIC=1      Musl libc 全静态链接，产物可直接分发到任意 Linux
 #   PIE=0         关闭 PIE（默认 1：动态用 -pie、静态用 -static-pie，保留 ASLR）
 #   ARCH=<arch>   指定目标架构（决定产物名与工具链）
+#   VARIANT=<名>  产物放 bin/<名>/、中间文件放 build/<名>/，多套构建互不覆盖
+#
+# 多架构 / 多编译器（GCC、zig）的现成组合见 script/ 目录，那里负责选工具链，
+# Makefile 只负责编译、链接与产物校验。
 
 APP       := pcdn-detect
 GIT_HASH  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -34,17 +38,23 @@ PIE    ?= 1
 ARCHS := mipsle mips armv7 arm64 amd64
 ARCH  ?=
 
+PROJECT_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+
 # 各架构的交叉工具链。产物是纯静态 ELF，只依赖内核 ABI，因此与部署发行版无关：
 # 默认优先使用通用 musl 交叉工具链（musl.cc / Alpine / Bootlin 的 <triple>-gcc），
 # OpenWrt 官方工具链作为同架构的备选，谁在 PATH 里就用谁；也可用 CC_<arch> 直接覆盖：
 #   make all CC_arm64=aarch64-linux-musl-gcc
+#
+# 候选名单（含 musl.cc / Alpine / OpenWrt 的三种命名）由 script/common.sh 统一给出，
+# 与 script/ 下的构建脚本共用同一份架构→triple 表，避免两处漂移。
 probe_cc = $(shell for c in $(1); do command -v $$c >/dev/null 2>&1 && { echo $$c; break; }; done)
+cc_candidates = $(shell "$(PROJECT_DIR)/script/common.sh" --cc-candidates $(1) 2>/dev/null)
 
-_CC_mipsle := $(or $(call probe_cc, mipsel-linux-muslsf-gcc mipsel-linux-musl-gcc mipsel-openwrt-linux-musl-gcc), mipsel-linux-musl-gcc)
-_CC_mips   := $(or $(call probe_cc, mips-linux-muslsf-gcc mips-linux-musl-gcc mips-openwrt-linux-musl-gcc), mips-linux-musl-gcc)
-_CC_armv7  := $(or $(call probe_cc, armv7l-linux-musleabihf-gcc arm-linux-musleabihf-gcc arm-openwrt-linux-musl-gcc), armv7l-linux-musleabihf-gcc)
-_CC_arm64  := $(or $(call probe_cc, aarch64-linux-musl-gcc aarch64-openwrt-linux-musl-gcc), aarch64-linux-musl-gcc)
-_CC_amd64  := $(or $(call probe_cc, musl-gcc x86_64-linux-musl-gcc), cc)
+_CC_mipsle = $(or $(call probe_cc, $(call cc_candidates,mipsle)), mipsel-linux-musl-gcc)
+_CC_mips   = $(or $(call probe_cc, $(call cc_candidates,mips)),   mips-linux-musl-gcc)
+_CC_armv7  = $(or $(call probe_cc, $(call cc_candidates,armv7)),  armv7l-linux-musleabihf-gcc)
+_CC_arm64  = $(or $(call probe_cc, $(call cc_candidates,arm64)),  aarch64-linux-musl-gcc)
+_CC_amd64  = $(or $(call probe_cc, $(call cc_candidates,amd64)),  cc)
 
 CC_mipsle ?= $(_CC_mipsle)
 CC_mips   ?= $(_CC_mips)
@@ -126,16 +136,19 @@ endif
 
 # 每种构建组合使用独立的目标文件目录：不同对齐方式 / 不同 libc / PIE 与非 PIE 的 .o
 # 混在一起链接会得到悄悄出错的二进制，物理隔离比事后排查便宜得多。
+# VARIANT 非空时再多一层目录（bin/<variant>/、build/<variant>/），供 script/ 下多套
+# 构建（gcc/zig、静态/动态）并存使用，互不覆盖。
 PIE_SUFFIX := $(if $(filter 1,$(PIE)),,-nopie)
-OBJDIR := $(if $(ARCH),build/$(ARCH),$(if $(filter 1,$(STATIC)),build/static,build/local))$(PIE_SUFFIX)
+OUTDIR     := bin$(if $(VARIANT),/$(VARIANT))
+OBJDIR     := $(if $(VARIANT),build/$(VARIANT)/,$(if $(ARCH),build/$(ARCH),$(if $(filter 1,$(STATIC)),build/static,build/local)))$(PIE_SUFFIX)
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:src/%.c=$(OBJDIR)/%.o)
 OBJ += $(OBJDIR)/toml.o $(OBJDIR)/cJSON.o $(OBJDIR)/picohttpparser.o
 
-BIN        := bin/$(APP)$(if $(ARCH),-$(ARCH))
+BIN        := $(OUTDIR)/$(APP)$(if $(ARCH),-$(ARCH))
 DEBUG_FILE := $(BIN).debug
-MODE_STAMP := bin/.link-mode$(if $(ARCH),-$(ARCH))
+MODE_STAMP := $(OUTDIR)/.link-mode$(if $(ARCH),-$(ARCH))
 .DEFAULT_GOAL := build
 
 .PHONY: all build test clean deps check-deps FORCE $(ARCHS)
@@ -167,11 +180,11 @@ check-deps:
 
 # 记录上次的链接参数：STATIC / PIE / DEBUG 变化时强制重新链接，
 # 避免把上一步的静态（或未剥离）二进制当成当前模式的产物。
-$(MODE_STAMP): FORCE | bin
+$(MODE_STAMP): FORCE | $(OUTDIR)
 	@echo 'STATIC=$(STATIC) PIE=$(PIE) DEBUG=$(DEBUG)' | cmp -s - $@ \
 		|| echo 'STATIC=$(STATIC) PIE=$(PIE) DEBUG=$(DEBUG)' > $@
 
-$(BIN): $(OBJ) $(MODE_STAMP) | check-deps $(OBJDIR) bin
+$(BIN): $(OBJ) $(MODE_STAMP) | check-deps $(OBJDIR) $(OUTDIR)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS)
 ifeq ($(DEBUG),1)
 	@echo "调试构建：完整调试符号保留在 $@"
@@ -208,7 +221,7 @@ $(OBJDIR)/cJSON.o: third_party/cJSON/cJSON.c | $(OBJDIR)
 $(OBJDIR)/picohttpparser.o: third_party/picohttpparser/picohttpparser.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -c $< -o $@
 
-$(OBJDIR) bin:
+$(OBJDIR) $(OUTDIR):
 	mkdir -p $@
 
 test: $(BIN)
