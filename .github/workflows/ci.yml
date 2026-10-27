@@ -1,0 +1,203 @@
+name: CI
+# 推送 / PR：本机 GCC 动态构建 + musl 全静态构建，跑单元 / HTTP 集成 / CLI 冒烟测试；
+# 再用 script/toolchain.sh 的 musl-cross GCC 与官方 zig 分别交叉编译全部发布架构，
+# 校验两条静态打包链路（gcc-static / zig-static）都能产出全静态 ELF。
+#
+# 两点前提：
+#   - Makefile 用 -std=c23，GCC 13 只认 -std=c2x，因此本机测试显式用 gcc-14（ubuntu-24.04）。
+#   - 静态构建不用系统的 musl-gcc/musl-tools，而是 script/toolchain.sh 从
+#     WomsxdTools/musl-libc-toolchains 下载的 musl-cross（musl 1.2.6 + GCC 15.1），
+#     与 release 打包用的是同一套编译器。
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (gcc / musl static)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-14 libc6-dev linux-libc-dev make binutils file tar xz-utils curl
+
+      - name: Show toolchain versions
+        run: |
+          gcc-14 --version | head -n 1
+          make --version | head -n 1
+
+      # 缓存 musl-cross 的 tar.gz，省下每次约 500 MB 的下载；解压很快，不缓存解压后的目录
+      - name: Cache musl-cross downloads
+        uses: actions/cache@v4
+        with:
+          path: .toolchains/downloads
+          key: musl-cross-${{ runner.os }}-${{ hashFiles('script/toolchain.sh', 'script/common.sh') }}
+          restore-keys: musl-cross-${{ runner.os }}-
+
+      - name: Test (native, gcc-14)
+        run: make -j"$(nproc)" CC=gcc-14 test
+
+      # 与 release 同一套工具链：musl-cross GCC 全静态链接后，把全部测试再跑一遍
+      - name: Test (musl-gcc, fully static)
+        run: |
+          set -euo pipefail
+          ./script/toolchain.sh -t amd64
+          tc="$(for d in "$PWD"/.toolchains/*-amd64; do
+                  [ -x "$d/bin/x86_64-linux-musl-gcc" ] && echo "$d"
+                done | tail -n 1)"
+          [ -n "$tc" ] || { echo "::error::未找到 amd64 的 musl-cross 工具链"; exit 1; }
+          export PATH="$tc/bin:$PATH"
+          make -j"$(nproc)" STATIC=1 CC=x86_64-linux-musl-gcc test
+          file -b bin/pcdn-detect | grep -qE 'static[a-z-]* linked'
+
+  build:
+    name: build (musl-gcc static, all architectures)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            make binutils file tar xz-utils curl
+
+      - name: Cache musl-cross downloads
+        uses: actions/cache@v4
+        with:
+          path: .toolchains/downloads
+          key: musl-cross-${{ runner.os }}-${{ hashFiles('script/toolchain.sh', 'script/common.sh') }}
+          restore-keys: musl-cross-${{ runner.os }}-
+
+      # OpenWrt 常见架构：mipsle / mips / armv7 / arm64 / amd64。
+      # script/gcc-static.sh 按需下载 musl-cross 工具链，产出 bin/gcc-static/pcdn-detect-<arch>
+      # （全静态 static-pie，工具链不支持 static-pie 时自动退回 PIE=0）。
+      - name: Cross compile (musl-gcc, static)
+        env:
+          VERSION: 0.0.0-ci
+        run: ./script/gcc-static.sh
+
+      # 版本注入自检：amd64 静态产物能直接在 runner 上运行，其余架构只能做 ELF 校验
+      - name: Verify version injection
+        run: |
+          set -euo pipefail
+          out="$(./bin/gcc-static/pcdn-detect-amd64 --version)"
+          echo "构建产物版本：$out"
+          case "$out" in
+            0.0.0-ci+*) ;;
+            *)
+              echo "::error::版本号注入异常（期望 0.0.0-ci+<git 短哈希>）：$out"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify static linking
+        run: |
+          set -euo pipefail
+          for arch in mipsle mips armv7 arm64 amd64; do
+            f="bin/gcc-static/pcdn-detect-$arch"
+            [ -f "$f" ] || { echo "::error::缺少产物 $f"; exit 1; }
+            info="$(file -b "$f")"
+            printf '%-24s %s\n' "pcdn-detect-$arch" "$info"
+            printf '%s' "$info" | grep -qE 'static[a-z-]* linked' \
+              || { echo "::error::$f 不是全静态可执行文件：$info"; exit 1; }
+          done
+
+  # 第二条打包链路：官方 zig 全静态（musl libc）。与 gcc-static 相互独立，
+  # 两边任一挂掉都会在 CI 里直接暴露，避免 release 时才发现某个工具链不可用。
+  zig:
+    name: build (zig static, all architectures)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            make binutils llvm file tar xz-utils curl
+
+      # 有的发行版只提供带版本号的 llvm-objcopy-<n> / llvm-strip-<n>，
+      # 这里补一个脚本要求的无后缀入口
+      - name: Locate llvm binutils
+        run: |
+          set -euo pipefail
+          for tool in llvm-objcopy llvm-strip; do
+            command -v "$tool" >/dev/null && continue
+            found="$(ls /usr/bin/"$tool"-* 2>/dev/null | sort -V | tail -n 1 || true)"
+            [ -n "$found" ] || { echo "::error::缺少 $tool（apt install llvm）"; exit 1; }
+            sudo ln -sf "$found" "/usr/local/bin/$tool"
+          done
+          llvm-objcopy --version | head -n 1
+          llvm-strip --version | head -n 1
+
+      # 只缓存 tar.xz，解压出来的 zig 目录（约 400 MB）不进缓存
+      - name: Cache zig downloads
+        uses: actions/cache@v4
+        with:
+          path: .zig/downloads
+          key: zig-${{ runner.os }}-${{ hashFiles('script/zig.sh', 'script/common.sh') }}
+          restore-keys: zig-${{ runner.os }}-
+
+      # 缓存里带着上次的 index.json，删掉才会重新解析到当前最新的稳定版
+      - name: Install official zig
+        run: |
+          set -euo pipefail
+          rm -f .zig/downloads/index.json
+          ./script/zig.sh
+          zig_bin="$(./script/zig.sh --path)"
+          echo "zig 版本：$("$zig_bin" version)（$zig_bin）"
+
+      # 产物：bin/zig-static/pcdn-detect-<arch>（全静态 static-pie，musl libc）
+      - name: Cross compile (zig, static)
+        env:
+          VERSION: 0.0.0-ci
+        run: ./script/zig-static.sh
+
+      - name: Verify version injection
+        run: |
+          set -euo pipefail
+          out="$(./bin/zig-static/pcdn-detect-amd64 --version)"
+          echo "构建产物版本：$out"
+          case "$out" in
+            0.0.0-ci+*) ;;
+            *)
+              echo "::error::版本号注入异常（期望 0.0.0-ci+<git 短哈希>）：$out"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify static linking
+        run: |
+          set -euo pipefail
+          for arch in mipsle mips armv7 arm64 amd64; do
+            f="bin/zig-static/pcdn-detect-$arch"
+            [ -f "$f" ] || { echo "::error::缺少产物 $f"; exit 1; }
+            info="$(file -b "$f")"
+            printf '%-24s %s\n' "pcdn-detect-$arch" "$info"
+            printf '%s' "$info" | grep -qE 'static[a-z-]* linked' \
+              || { echo "::error::$f 不是全静态可执行文件：$info"; exit 1; }
+          done
