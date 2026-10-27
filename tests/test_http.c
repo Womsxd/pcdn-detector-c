@@ -1,4 +1,5 @@
 /* HTTP API 集成测试：启动真实监听并用 curl 验证鉴权 / CORS / 路由 */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -17,14 +18,14 @@ static int g_fail;
         }                                                                                      \
     } while (0)
 
-static int g_reload_calls;
+static atomic_int g_reload_calls;
 
 static int reload_stub(void *ctx, reload_result *res, char *err, size_t errlen)
 {
     (void)ctx;
     (void)err;
     (void)errlen;
-    g_reload_calls++;
+    atomic_fetch_add(&g_reload_calls, 1);
     res->applied = xmalloc(sizeof(char *));
     res->applied[0] = xstrdup("detect");
     res->napplied = 1;
@@ -215,7 +216,7 @@ int main(void)
              body, sizeof(body), headers, sizeof(headers), &status);
     CHECK(status == 200);
     CHECK(strstr(body, "\"applied\":[\"detect\"]") != NULL);
-    CHECK(g_reload_calls == 1);
+    CHECK(atomic_load(&g_reload_calls) == 1);
 
     /* CORS 预检不需要 Authorization */
     run_curl("-X OPTIONS -H 'Origin: https://x.example' -H 'Access-Control-Request-Method: GET' "
