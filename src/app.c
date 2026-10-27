@@ -185,8 +185,8 @@ static void print_usage(FILE *out, const config_t *cfg)
     fprintf(out, "选项（短/长形式等价）:\n");
     fprintf(out, "  -i, --interface <网卡>       要监听的网卡名称（必填），如 br-lan、br0、eth0\n");
     fprintf(out, "  -n, --count <次数>           触发次数：窗口内同一设备同一端口的不同远端公网 "
-                 "IP 数（默认 %d）\n",
-            cfg->detect.threshold);
+                 "IP 数（默认 %d，最大 %d）\n",
+            cfg->detect.threshold, PCDN_LIMIT_MAX);
     fprintf(out, "  -t, --window <时长>          检测时长（滑动窗口，默认 %s）\n", w);
     fprintf(out, "  -a, --alert-duration <时长>  持续提示时长（默认 %s）\n", a);
     fprintf(out, "  -p, --promisc <布尔>         是否开启混杂模式（默认 %s）\n",
@@ -198,10 +198,12 @@ static void print_usage(FILE *out, const config_t *cfg)
     fprintf(out, "  -L, --low-memory <布尔>      低内存模式：触发告警后清空对端列表且不再记录新对端"
                  "（默认 %s）\n",
             cfg->memory.low_memory ? "true" : "false");
-    fprintf(out, "      --peer-limit <数量>      单端口对端记录上限（默认 %d，0 表示不限制；无短选项）\n",
-            config_peer_limit_value(cfg));
-    fprintf(out, "      --max-ports <数量>       单设备端口条目上限（默认 %d，0 表示不限制；无短选项）\n",
-            config_max_ports_value(cfg));
+    fprintf(out,
+            "      --peer-limit <数量>      单端口对端记录上限（默认 %d，0 表示不限制，最大 %d；无短选项）\n",
+            config_peer_limit_value(cfg), PCDN_LIMIT_MAX);
+    fprintf(out,
+            "      --max-ports <数量>       单设备端口条目上限（默认 %d，0 表示不限制，最大 %d；无短选项）\n",
+            config_max_ports_value(cfg), PCDN_LIMIT_MAX);
     fprintf(out, "  -P, --protocol <协议>        抓包协议：udp / tcp / all（默认 %s）\n",
             config_capture_proto(cfg));
     fprintf(out, "  -c, --config <路径>          指定配置文件路径（只读取该文件，不自动创建）\n");
@@ -299,8 +301,8 @@ static void parse_args(int argc, char **argv, const config_t *cfg, cli_overrides
             NEEDVAL();
             char *end = NULL;
             long v = strtol(val, &end, 10);
-            if (!end || *end != '\0' || v <= 0)
-                cli_usage_error("-n/--count 触发次数必须大于 0");
+            if (!end || *end != '\0' || v <= 0 || v > PCDN_LIMIT_MAX)
+                cli_usage_error("-n/--count 触发次数必须在 1~%d 之间", PCDN_LIMIT_MAX);
             trigger = (int)v;
             ov->trigger_set = true;
         } else if (IS("t") || IS("window")) {
@@ -354,16 +356,18 @@ static void parse_args(int argc, char **argv, const config_t *cfg, cli_overrides
             NEEDVAL();
             char *end = NULL;
             long v = strtol(val, &end, 10);
-            if (!end || *end != '\0')
-                cli_usage_error("--peer-limit 需要整数");
+            if (!end || *end != '\0' || v < 0 || v > PCDN_LIMIT_MAX)
+                cli_usage_error("--peer-limit 必须是 0~%d 之间的整数（0 表示不限制）",
+                                PCDN_LIMIT_MAX);
             peer = (int)v;
             ov->peer_set = true;
         } else if (IS("max-ports")) {
             NEEDVAL();
             char *end = NULL;
             long v = strtol(val, &end, 10);
-            if (!end || *end != '\0')
-                cli_usage_error("--max-ports 需要整数");
+            if (!end || *end != '\0' || v < 0 || v > PCDN_LIMIT_MAX)
+                cli_usage_error("--max-ports 必须是 0~%d 之间的整数（0 表示不限制）",
+                                PCDN_LIMIT_MAX);
             maxp = (int)v;
             ov->max_set = true;
         } else if (IS("P") || IS("protocol")) {
@@ -416,7 +420,7 @@ static void parse_args(int argc, char **argv, const config_t *cfg, cli_overrides
         int v = 1000;
         int64_t scaled = (int64_t)trigger * 10;
         if (scaled > v)
-            v = scaled > INT_MAX ? INT_MAX : (int)scaled;
+            v = scaled > PCDN_LIMIT_MAX ? PCDN_LIMIT_MAX : (int)scaled;
         if (low)
             v = trigger;
         if (cfg->memory.has_peer_limit)
@@ -428,6 +432,9 @@ static void parse_args(int argc, char **argv, const config_t *cfg, cli_overrides
         else
             eff_peer = v;
     }
+    /* 配置文件里的显式值可能未经过 config_validate（非 -T 路径），这里再兜一次底 */
+    if (eff_peer > PCDN_LIMIT_MAX)
+        eff_peer = PCDN_LIMIT_MAX;
 
     free(ov->iface);
     ov->iface = iface;
@@ -581,6 +588,10 @@ static void parse_cli(int argc, char **argv, cli_result *out)
     }
     if (out->cfg.detect.threshold <= 0) {
         fprintf(stderr, "错误：-n/--count 触发次数必须大于 0\n");
+        exit(2);
+    }
+    if (out->cfg.detect.threshold > PCDN_LIMIT_MAX) {
+        fprintf(stderr, "错误：-n/--count 触发次数不能超过 %d\n", PCDN_LIMIT_MAX);
         exit(2);
     }
     if (out->cfg.detect.window <= 0) {

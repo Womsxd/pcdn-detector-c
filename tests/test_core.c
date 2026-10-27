@@ -394,23 +394,52 @@ static void test_peer_limit_overflow(void)
     config_default(&cfg);
     cfg.detect.threshold = INT32_MAX;
     int v = config_peer_limit_value(&cfg);
-    CHECK(v > 0);
-    CHECK(v >= cfg.detect.threshold);
+    CHECK(v == PCDN_LIMIT_MAX);
     config_free(&cfg);
 
     config_default(&cfg);
     cfg.detect.threshold = INT32_MAX;
     cfg.memory.low_memory = true;
     v = config_peer_limit_value(&cfg);
-    CHECK(v > 0);
+    CHECK(v == PCDN_LIMIT_MAX);
     config_free(&cfg);
 
     config_default(&cfg);
-    cfg.detect.threshold = 1000000000;
+    cfg.detect.threshold = 1000;
     cfg.memory.has_peer_limit = true;
     cfg.memory.peer_limit = 500;
     v = config_peer_limit_value(&cfg);
-    CHECK(v == 500 || v == 1000000000);
+    CHECK(v == 1000); /* 低于阈值时抬到阈值，保证仍能触发告警 */
+    config_free(&cfg);
+}
+
+static void test_limit_bounds(void)
+{
+    char err[512];
+    config_t cfg;
+    config_default(&cfg);
+    free(cfg.capture.iface);
+    cfg.capture.iface = xstrdup("lo");
+
+    cfg.memory.has_peer_limit = true;
+    cfg.memory.peer_limit = PCDN_LIMIT_MAX;
+    CHECK(config_validate(&cfg, err, sizeof(err)));
+    cfg.memory.peer_limit = PCDN_LIMIT_MAX + 1;
+    CHECK(!config_validate(&cfg, err, sizeof(err)));
+    CHECK(strstr(err, "peer_limit") != NULL);
+
+    cfg.memory.has_peer_limit = false;
+    cfg.memory.has_max_ports = true;
+    cfg.memory.max_ports = PCDN_LIMIT_MAX + 1;
+    CHECK(!config_validate(&cfg, err, sizeof(err)));
+    CHECK(strstr(err, "max_ports") != NULL);
+    cfg.memory.has_max_ports = false;
+
+    cfg.detect.threshold = PCDN_LIMIT_MAX + 1;
+    CHECK(!config_validate(&cfg, err, sizeof(err)));
+    CHECK(strstr(err, "threshold") != NULL);
+    cfg.detect.threshold = PCDN_LIMIT_MAX;
+    CHECK(config_validate(&cfg, err, sizeof(err)));
     config_free(&cfg);
 }
 
@@ -484,6 +513,7 @@ int main(void)
     test_util();
     test_config();
     test_peer_limit_overflow();
+    test_limit_bounds();
     test_filter();
     test_detector_alerts();
     test_detector_limits();

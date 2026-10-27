@@ -325,15 +325,16 @@ static int normalize_peer_limit(int limit, int threshold)
 int config_peer_limit_value(const config_t *cfg)
 {
     int v = DEFAULT_PEER_LIMIT;
-    /* 阈值可由配置给到 INT32_MAX，乘系数前必须提升到 64 位并饱和 */
+    /* 阈值可由配置给到 INT32_MAX，乘系数前必须提升到 64 位并饱和到上限 */
     int64_t scaled = (int64_t)cfg->detect.threshold * PEER_LIMIT_FACTOR;
     if (scaled > v)
-        v = scaled > INT_MAX ? INT_MAX : (int)scaled;
+        v = scaled > PCDN_LIMIT_MAX ? PCDN_LIMIT_MAX : (int)scaled;
     if (cfg->memory.low_memory)
         v = cfg->detect.threshold;
     if (cfg->memory.has_peer_limit)
         v = cfg->memory.peer_limit;
-    return normalize_peer_limit(v, cfg->detect.threshold);
+    int r = normalize_peer_limit(v, cfg->detect.threshold);
+    return r > PCDN_LIMIT_MAX ? PCDN_LIMIT_MAX : r;
 }
 
 int config_max_ports_value(const config_t *cfg)
@@ -342,7 +343,7 @@ int config_max_ports_value(const config_t *cfg)
         return DEFAULT_MAX_PORTS;
     if (cfg->memory.max_ports <= 0)
         return 0;
-    return cfg->memory.max_ports;
+    return cfg->memory.max_ports > PCDN_LIMIT_MAX ? PCDN_LIMIT_MAX : cfg->memory.max_ports;
 }
 
 int config_device_ip_limit(const config_t *cfg)
@@ -1570,6 +1571,11 @@ bool config_validate(const config_t *cfg, char *err, size_t errlen)
         set_err(err, errlen, "[detect] threshold 必须大于 0，得到 %d", cfg->detect.threshold);
         return false;
     }
+    if (cfg->detect.threshold > PCDN_LIMIT_MAX) {
+        set_err(err, errlen, "[detect] threshold 不能超过 %d，得到 %d", PCDN_LIMIT_MAX,
+                cfg->detect.threshold);
+        return false;
+    }
     char d1[64], d2[64], d3[64];
     if (cfg->detect.window <= 0) {
         fmt_duration(cfg->detect.window, d1, sizeof(d1));
@@ -1607,6 +1613,16 @@ bool config_validate(const config_t *cfg, char *err, size_t errlen)
         set_err(err, errlen,
                 "[memory] gc_percent 须在 1~1000 之间，得到 %d（推荐 20~50）",
                 cfg->memory.gc_percent);
+        return false;
+    }
+    if (cfg->memory.has_peer_limit && cfg->memory.peer_limit > PCDN_LIMIT_MAX) {
+        set_err(err, errlen, "[memory] peer_limit 不能超过 %d，得到 %d", PCDN_LIMIT_MAX,
+                cfg->memory.peer_limit);
+        return false;
+    }
+    if (cfg->memory.has_max_ports && cfg->memory.max_ports > PCDN_LIMIT_MAX) {
+        set_err(err, errlen, "[memory] max_ports 不能超过 %d，得到 %d", PCDN_LIMIT_MAX,
+                cfg->memory.max_ports);
         return false;
     }
 

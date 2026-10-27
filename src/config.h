@@ -4,6 +4,10 @@
 
 #include "common.h"
 
+/* 阈值 / 单端口对端上限 / 单设备端口上限的统一上限：远高于家庭场景可能出现的量级，
+ * 只用于拦截误配置与 long→int 截断，不用于表达“合理值”。0 始终表示不限制。 */
+#define PCDN_LIMIT_MAX 200000000
+
 typedef struct {
     bool is_str;   /* true：表达式字符串；false：整数端口 */
     int64_t ival;
