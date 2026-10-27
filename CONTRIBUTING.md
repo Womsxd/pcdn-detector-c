@@ -86,9 +86,10 @@ system development packages are involved — capture is implemented directly on
 (tomlc99 / cJSON / uthash / picohttpparser) are vendored as **git submodules**
 under `third_party/`.
 
-`make STATIC=1` produces a fully static Musl binary, and `make all` (or
-`./build-all-static.sh`) produces static binaries for all architectures under
-`bin/`.
+`make STATIC=1` produces a fully static Musl binary, and `make all` produces
+static binaries for all architectures under `bin/`. For a fully automatic run —
+toolchain provisioning included, or using zig instead of GCC — use the scripts
+under `script/` (`./script/gcc-static.sh`, `./script/zig-static.sh`).
 
 Running the binary for real requires `root` or `CAP_NET_RAW` and a LAN-side
 interface such as `br-lan`. Unit tests do **not** need privileges, a real
@@ -218,8 +219,9 @@ make test                                # 单元 / HTTP / CLI 测试
 ——抓包直接基于 `AF_PACKET` + `TPACKET_V2` 与内核经典 BPF 实现；依赖（tomlc99 / cJSON /
 uthash / picohttpparser）以 **git submodule** 形式放在 `third_party/`。
 
-`make STATIC=1` 产出 Musl 全静态二进制；`make all`（或 `./build-all-static.sh`）会在
-`bin/` 下产出各架构的静态产物。
+`make STATIC=1` 产出 Musl 全静态二进制；`make all` 会在 `bin/` 下产出各架构的静态产物。
+要连工具链一起自动准备、或改用 zig 编译，用 `script/` 下的脚本
+（`./script/gcc-static.sh`、`./script/zig-static.sh`）。
 
 实际运行二进制需要 `root` 或 `CAP_NET_RAW`，并指定 LAN 侧网卡（如 `br-lan`）。单元测试
 **不需要**特权、真实网卡或运行中的防火墙。

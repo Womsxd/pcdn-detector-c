@@ -22,9 +22,13 @@ make all                                  # 多架构静态产物 bin/pcdn-detec
 make DEBUG=1                              # 保留完整调试符号
 make PIE=0                                # 关闭 PIE（默认开启）
 make clean                                # 清理 build/ 与 bin/
+
+./script/gcc-static.sh                    # 一键全架构静态（自动准备交叉工具链）
+./script/zig-static.sh                    # 同上，改用官方 zig
+./script/zig-dynamic.sh --libc musl       # zig 动态链接，可选 glibc / musl
 ```
 
-依赖与 submodule 说明、调试符号拆分、交叉工具链、`build-all-static.sh`、静态构建原理、
+依赖与 submodule 说明、调试符号拆分、交叉工具链、`script/` 多架构脚本、静态构建原理、
 构建变量与产物校验见 [构建与交叉编译](docs/build.md)。
 
 ## 运行

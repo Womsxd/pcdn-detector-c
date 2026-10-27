@@ -14,6 +14,72 @@
 
 系统库：`pthread`（线程）、Linux `AF_PACKET` + 经典 BPF（抓包，内核 API，无 libpcap 依赖）。
 
+### 宿主机依赖包
+
+以下按用途分组，装齐「必需」即可完成 `make` / `make test`；其余按需：
+
+| 用途 | 需要的包 | 说明 |
+| --- | --- | --- |
+| 必需 | C23 编译器（`gcc` 13+ 或 `clang` 16+）、`make`、`git` | `git` 只用于拉 submodule |
+| 必需 | `binutils`、`file`、`coreutils` | `objcopy`/`strip` 拆调试符号，`file` 校验产物，`sha256sum` 校验工具链 |
+| 必需 | `tar`（配 `xz` / `gzip`） | `script/toolchain.sh` 解压交叉工具链 |
+| 下载工具链 / zig | `curl` 或 `wget` | `script/toolchain.sh` 与 zig 安装包 |
+| 解压兜底（可选） | `7z` 或 `python3` | 老内核缺 `openat2` 时 GNU tar 会报 `Function not implemented`，脚本自动改用二者之一 |
+| 本机静态构建 | musl 工具链（`musl-gcc`） | 只有 `make STATIC=1` 需要；用 `script/gcc-*.sh` 时由它下载的 musl-cross 代替，可跳过 |
+| zig 构建 | zig 0.17+ | 用 `./script/zig.sh` 下载官方包（发行版包通常落后，见下文） |
+| zig 构建 | LLVM（`llvm-objcopy` / `llvm-strip`） | 交叉架构拆分符号必需，宿主 GNU binutils 只认本机架构 |
+
+各发行版一次性安装：
+
+```bash
+# Fedora
+sudo dnf install gcc make git tar xz curl binutils file llvm musl-gcc 7zip
+
+# Debian / Ubuntu
+sudo apt install gcc make git tar xz-utils curl binutils file llvm musl-tools p7zip-full
+
+# Alpine（cc 本身就是 musl，无需 musl-gcc）
+sudo apk add build-base make git tar xz curl binutils file llvm python3 p7zip
+
+# Arch
+sudo pacman -S --needed base-devel git tar xz curl binutils file llvm musl p7zip
+```
+
+需要注意的点：
+
+- **编译器版本**：Debian 12 / Ubuntu 22.04 自带的 gcc 11/12 不支持 `-std=c23`，需额外装
+  `gcc-13`（或 `clang-16`）并用 `make CC=gcc-13`；Ubuntu 24.04 起的 gcc 13 可以直接用。
+- **`musl-tools` 只影响 `make STATIC=1`**：它提供 `musl-gcc` 包装脚本，本机静态构建用它；
+  跨架构的 `script/gcc-static.sh` 用的是 `.toolchains/` 里的 musl-cross，不需要它。
+- **zig 建议用官方 0.17+**：脚本按 0.17 的链接行为编写（`-static-pie` 必须配合 `-fPIE`
+  才真的产出 PIE，动态 musl 必须显式 `-dynamic`）。0.16 在脚本下也能用（`-fPIE` 已带上），
+  更早的版本若探测不到 PIE 会自动降级为 `PIE=0` 并打印提示。用 `ZIG=/path/to/zig`
+  指向官方解压目录里的可执行文件即可。
+- 上述包都只是**构建期**依赖：产物本身是静态 ELF，不依赖目标机的 libc 或这些工具。
+
+### 安装 zig（官方包）
+
+发行版仓库通常落后于官方（例如 Fedora 打包的是 0.16），而本仓库的脚本按 0.17 的链接行为适配，
+所以建议直接用官方包。脚本可以代下载：
+
+```bash
+./script/zig.sh                       # 最新稳定版 → .zig/<版本>/
+./script/zig.sh --version 0.17.0      # 指定版本
+./script/zig.sh --master              # master（每日构建）
+./script/zig.sh --list                # 已下载的版本
+./script/zig.sh --path                # 当前会使用的 zig
+./script/zig.sh --clean               # 删除 .zig/ 与下载缓存
+```
+
+- 下载后按官方 `index.json` 里的 `shasum` 做 SHA256 校验；解压同样是 tar → 7z → python3 兜底。
+- 解压到 `.zig/zig-<platform>-<version>/`（已在 `.gitignore` 中）。单个版本约 57 MB 下载、400 MB 解压。
+- **解析顺序**：`$ZIG` → `.zig/`（取版本号最大的）→ `PATH` 里的 `zig`。装好之后
+  `./script/zig-static.sh`、`./script/zig-dynamic.sh` 会自动使用它，不需要设置任何环境变量。
+- 手工从 ziglang.org 下载的包同样适用：把解压目录放进 `.zig/`，或用
+  `ZIG=/path/to/zig ./script/zig-static.sh` 显式指定。
+- 只有在 `PATH` 里已有合适版本的 zig 时才会用到它；版本太旧时脚本探测不到 PIE 会自动
+  退回 `PIE=0` 并提示。
+
 首次检出后拉取依赖：
 
 ```bash
@@ -125,43 +191,72 @@ make ARCH=arm64 CC=aarch64-linux-musl-gcc STATIC=1
 > 以上只是「编出某个架构的静态二进制」。若目标就是本机 x86-64（Debian / Ubuntu /
 > CentOS / 容器），不需要任何交叉工具链，`make STATIC=1` 就够了。
 
-## 一键多架构构建（预编译工具链）
+## 一键多架构构建（script/ 脚本）
 
-`build-all-static.sh` 直接下载预编译的 musl 交叉工具链
-（[WomsxdTools/musl-libc-toolchains](https://github.com/WomsxdTools/musl-libc-toolchains)，
-musl 1.2.6 + GCC 15.1.0），解压后产出全部架构的静态二进制：
+`script/` 按「编译器 × 链接方式」拆成四个脚本，产物各自落在 `bin/<变体>/`，互不覆盖，
+目标文件也按变体隔离（`build/<变体>/<arch>`），来回切换不需要 `make clean`：
+
+| 脚本 | 产物目录 | 说明 |
+| --- | --- | --- |
+| `script/gcc-static.sh` | `bin/gcc-static/` | musl-cross GCC，全静态 `static-pie` |
+| `script/gcc-dynamic.sh` | `bin/gcc-dynamic/` | musl-cross GCC，动态链接 musl |
+| `script/zig-static.sh` | `bin/zig-static/` | 官方 zig，全静态 `static-pie`（musl） |
+| `script/zig-dynamic.sh` | `bin/zig-dynamic-<glibc\|musl>/` | 官方 zig，动态链接，`--libc` 选 libc |
 
 ```bash
-./build-all-static.sh                    # 全部架构：下载工具链 + 编译项目
-./build-all-static.sh -t "arm64 amd64"   # 只做指定架构
-./build-all-static.sh --toolchain-only   # 只下载/解压工具链，稍后再 make all
-./build-all-static.sh --clean            # 删除已下载/解压的工具链
-./build-all-static.sh --tag <tag>        # 指定 release（默认 musl-cross-1.2.6-gcc15.1.0-20261026）
-./build-all-static.sh --base-url <url>   # 换镜像源
+./script/gcc-static.sh                      # 全部架构：下载工具链 + 编译
+./script/gcc-static.sh -t "arm64 amd64"     # 只做指定架构
+./script/gcc-static.sh -j 8                 # make 并行度
+./script/zig.sh                             # 下载官方 zig 到 .zig/（可选，脚本会自动使用）
+./script/zig-static.sh                      # zig 全静态
+./script/zig-dynamic.sh --libc musl         # zig 动态 + musl
+./script/zig-dynamic.sh --libc glibc        # zig 动态 + glibc（默认）
+ZIG=/opt/zig/zig ./script/zig-static.sh     # 指定 zig 路径
+DEBUG=1 ./script/gcc-static.sh              # 保留完整调试符号
 ```
 
-| 架构 | 资产后缀 | target triple |
-| --- | --- | --- |
-| `mipsle` | `-mipsle` | `mipsel-linux-muslsf`（o32 小端 soft-float） |
-| `mips` | `-mips` | `mips-linux-muslsf`（o32 大端 soft-float） |
-| `armv7` | `-armv7` | `arm-linux-musleabihf`（VFPv3-D16） |
-| `arm64` | `-arm64` | `aarch64-linux-musl` |
-| `amd64` | `-amd64` | `x86_64-linux-musl` |
+GCC 脚本用 `.toolchains/` 里的 musl-cross 工具链，缺失时自动由 `script/toolchain.sh`
+下载（[WomsxdTools/musl-libc-toolchains](https://github.com/WomsxdTools/musl-libc-toolchains)，
+musl 1.2.6 + GCC 15.1.0）。也可以单独管理工具链：
+
+```bash
+./script/toolchain.sh                     # 缺哪个架构装哪个
+./script/toolchain.sh -t "arm64 amd64"    # 只装指定架构
+./script/toolchain.sh --list              # 列出已就位的工具链
+./script/toolchain.sh --clean             # 删除工具链与下载缓存
+./script/toolchain.sh --tag <tag>         # 固定 release（默认 latest）
+./script/toolchain.sh --base-url <url>    # 换镜像源
+```
+
+| 架构 | GCC（musl-cross） | zig musl | zig glibc |
+| --- | --- | --- | --- |
+| `mipsle` | `mipsel-linux-muslsf`（o32 小端 soft-float） | `mipsel-linux-musleabi` | `mipsel-linux-gnueabi` |
+| `mips` | `mips-linux-muslsf`（o32 大端 soft-float） | `mips-linux-musleabi` | `mips-linux-gnueabi` |
+| `armv7` | `arm-linux-musleabihf`（VFPv3-D16） | `arm-linux-musleabihf` | `arm-linux-gnueabihf` |
+| `arm64` | `aarch64-linux-musl` | `aarch64-linux-musl` | `aarch64-linux-gnu` |
+| `amd64` | `x86_64-linux-musl` | `x86_64-linux-musl` | `x86_64-linux-gnu` |
 
 注意：
 
 - 工具链解压到 `.toolchains/<tag>-<arch>/`，tar.gz 缓存在 `.toolchains/downloads/`
   （可复用、可离线；`--clean` 一并删除）。单架构约 100 MB 下载、400 MB 解压。
 - 下载后按 release 附带的 `SHA256SUMS` 校验；拿不到时只提示、不中断。
-- 该工具链的 musl 未用 `-fPIC` 编译，`-static-pie` 链接会失败，脚本检测到后自动
-  传 `PIE=0`（产物仍是全静态 ELF，只是没有 ASLR），并打印提示。
-- 解压前会用 `-std=c23` 试编一次，确认工具链支持本项目要求的标准。
-- 工具链装好后也可以直接手工使用：
+- 解压优先用系统 `tar`；老内核缺 `openat2` 时 GNU tar 会报 `Function not implemented`，
+  自动改用 7z / `python3` 兜底。
+- 脚本每次都探测 `-static-pie` 是否真的产出 PIE（工具链的 musl 若不是 `-fPIC` 编译，
+  链接会退化成非 PIE）：探测失败自动退回 `PIE=0`（仍全静态，只是没有 ASLR）并提示。
+- zig 侧：`-static-pie` 只有在 CC 里同时带 `-fPIE` 时才真的产出 PIE；动态 + musl 必须
+  显式 `-dynamic`（zig 对 musl 目标默认静态链接）。这些细节脚本都已处理并做产物校验。
+- zig 交叉构建需要 `llvm-objcopy` / `llvm-strip`（宿主 GNU binutils 只认本机架构）。
 
-  ```bash
-  PATH="$PWD/.toolchains/musl-cross-1.2.6-gcc15.1.0-20261026-arm64/bin:$PATH" \
-      make all CC_arm64=aarch64-linux-musl-gcc
-  ```
+`make all` / `make <arch>` 仍然可用，用的是 PATH 里已有的交叉工具链（Alpine / OpenWrt SDK /
+musl.cc 都行），不下载任何东西；候选名单与 `script/` 共用 `script/common.sh` 里的同一份
+架构→triple 表：
+
+```bash
+PATH="$PWD/.toolchains/musl-cross-1.2.6-gcc15.1.0-20261026-arm64/bin:$PATH" \
+    make all CC_arm64=aarch64-linux-musl-gcc
+```
 
 ## 静态构建（Musl libc）
 
