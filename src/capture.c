@@ -626,17 +626,21 @@ int capturer_run(capturer *c, char *err, size_t errlen)
             if (!(hdr->tp_status & TP_STATUS_USER))
                 break;
             int wirelen = (int)hdr->tp_len;
+            size_t frame_size = (size_t)c->ring.frame_size;
+            size_t mac_off = hdr->tp_mac;
+            /* 先校验 tp_mac 落在本帧内，再据此裁剪长度：越界的偏移不能用来构造指针 */
+            if (mac_off > frame_size) {
+                __sync_synchronize();
+                hdr->tp_status = TP_STATUS_KERNEL;
+                frame_idx = (frame_idx + 1) % c->ring.frame_count;
+                continue;
+            }
             size_t caplen = hdr->tp_snaplen;
-            size_t avail = c->ring.ring_size - ((size_t)frame_idx * (size_t)c->ring.frame_size);
-            if (hdr->tp_mac > avail || hdr->tp_mac > (uint32_t)c->ring.frame_size)
-                caplen = 0;
-            else if (caplen > avail - hdr->tp_mac)
-                caplen = avail - hdr->tp_mac;
-            size_t frame_avail = (size_t)c->ring.frame_size - hdr->tp_mac;
+            size_t frame_avail = frame_size - mac_off;
             if (caplen > frame_avail)
                 caplen = frame_avail;
             int64_t ts_ns = (int64_t)hdr->tp_sec * 1000000000LL + hdr->tp_nsec;
-            handle_frame(c, base + hdr->tp_mac, caplen, wirelen, ts_ns);
+            handle_frame(c, base + mac_off, caplen, wirelen, ts_ns);
             __sync_synchronize();
             hdr->tp_status = TP_STATUS_KERNEL;
             frame_idx = (frame_idx + 1) % c->ring.frame_count;
