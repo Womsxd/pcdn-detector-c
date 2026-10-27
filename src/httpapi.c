@@ -50,15 +50,20 @@ static void json_send(http_response *res, int code, cJSON *root)
 {
     char *s = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    strbuf sb;
-    sb_init(&sb);
-    if (s) {
-        sb_add(&sb, s);
-        free(s);
+    if (!s) {
+        http_response_set_body(res, code, "application/json; charset=utf-8", "{}\n", 3);
+        return;
     }
-    sb_addc(&sb, '\n');
-    http_response_set_body(res, code, "application/json; charset=utf-8", sb.p, sb.n);
-    sb_free(&sb);
+    /* 直接接管 cJSON 的打印结果，省掉一次整份 JSON 的拷贝；
+     * 结尾换行交给 write_response 单独发送（计入 Content-Length） */
+    res->status = code;
+    snprintf(res->content_type, sizeof(res->content_type), "%s",
+             "application/json; charset=utf-8");
+    sb_free(&res->body);
+    res->body.p = s;
+    res->body.n = strlen(s);
+    res->body.cap = res->body.n + 1;
+    res->trailing_newline = true;
 }
 
 static void json_error(http_response *res, int code, const char *fmt, ...)

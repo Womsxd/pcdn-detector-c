@@ -22,6 +22,9 @@ typedef struct {
     char content_type[128];
     strbuf body;
     strbuf headers;
+    /* body 之后额外发送一个 '\n'（计入 Content-Length）：让 JSON 接管打印结果时
+     * 不必为追加换行再做一次 realloc/拷贝 */
+    bool trailing_newline;
 } http_response;
 
 typedef void (*http_handler_fn)(void *ctx, const http_request *req, http_response *res);

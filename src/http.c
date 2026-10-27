@@ -84,6 +84,7 @@ void http_response_init(http_response *res)
 {
     memset(res, 0, sizeof(*res));
     res->status = 200;
+    res->trailing_newline = false;
     snprintf(res->content_type, sizeof(res->content_type), "application/json; charset=utf-8");
     sb_init(&res->body);
     sb_init(&res->headers);
@@ -101,6 +102,7 @@ void http_response_set_body(http_response *res, int status, const char *content_
                             const char *body, size_t len)
 {
     res->status = status;
+    res->trailing_newline = false;
     if (content_type)
         snprintf(res->content_type, sizeof(res->content_type), "%s", content_type);
     sb_reset(&res->body);
@@ -382,13 +384,14 @@ static void write_response(int fd, const http_response *res, bool head_only, boo
     gmtime_r(&now, &tm);
     strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", &tm);
 
+    size_t body_len = res->body.n + (res->trailing_newline ? 1u : 0u);
     char head[1024];
     int n = snprintf(head, sizeof(head),
                      "HTTP/1.1 %d %s\r\nDate: %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
                      "Connection: %s\r\n",
                      res->status, status_text(res->status), date,
                      res->content_type[0] ? res->content_type : "application/octet-stream",
-                     res->body.n, keep_alive ? "keep-alive" : "close");
+                     body_len, keep_alive ? "keep-alive" : "close");
     if (n < 0)
         return;
     int64_t deadline = mono_ms() + WRITE_TIMEOUT_MS;
@@ -398,8 +401,12 @@ static void write_response(int fd, const http_response *res, bool head_only, boo
         return;
     if (!send_all_deadline(fd, "\r\n", 2, deadline))
         return;
-    if (!head_only && res->body.n > 0)
-        send_all_deadline(fd, res->body.p, res->body.n, deadline);
+    if (head_only)
+        return;
+    if (res->body.n > 0 && !send_all_deadline(fd, res->body.p, res->body.n, deadline))
+        return;
+    if (res->trailing_newline)
+        send_all_deadline(fd, "\n", 1, deadline);
 }
 
 typedef struct {
