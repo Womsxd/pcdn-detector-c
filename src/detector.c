@@ -181,6 +181,8 @@ static uint8_t (*peer_collect_new(peer_set *s, size_t *nout))[16]
         if (e->reported)
             continue;
         e->reported = true;
+        /* IPv4 只写前 4 字节，其余必须清零：元素会整体参与 qsort 交换 */
+        memset(keys[n], 0, 16);
         memcpy(keys[n], e->key, s->keylen);
         n++;
     }
