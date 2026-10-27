@@ -91,11 +91,18 @@ static void bpf_mark(bpf_builder *b, int label)
 
 static void bpf_jeq(bpf_builder *b, uint32_t val, int label)
 {
-    if (b->njumps < (int)ARRAY_LEN(b->jumps)) {
-        b->jumps[b->njumps].idx = b->n;
-        b->jumps[b->njumps].label = label;
-        b->njumps++;
+    if (label < 0 || label >= (int)ARRAY_LEN(b->labels)) {
+        b->failed = true;
+        return;
     }
+    if (b->njumps >= (int)ARRAY_LEN(b->jumps)) {
+        /* 跳转表满：不能静默丢弃，否则会生成语义错误的过滤器 */
+        b->failed = true;
+        return;
+    }
+    b->jumps[b->njumps].idx = b->n;
+    b->jumps[b->njumps].label = label;
+    b->njumps++;
     bpf_emit(b, BPF_JMP | BPF_JEQ | BPF_K, val, 0, 0);
 }
 
@@ -107,7 +114,12 @@ static bool bpf_resolve(bpf_builder *b)
 {
     for (int i = 0; i < b->njumps; i++) {
         int idx = b->jumps[i].idx;
-        int target = b->labels[b->jumps[i].label];
+        int label = b->jumps[i].label;
+        if (label < 0 || label >= (int)ARRAY_LEN(b->labels)) {
+            b->failed = true;
+            return false;
+        }
+        int target = b->labels[label];
         int skip = target - (idx + 1);
         if (skip < 0 || skip > 255) {
             b->failed = true;
