@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -324,9 +325,10 @@ static int normalize_peer_limit(int limit, int threshold)
 int config_peer_limit_value(const config_t *cfg)
 {
     int v = DEFAULT_PEER_LIMIT;
-    int scaled = cfg->detect.threshold * PEER_LIMIT_FACTOR;
+    /* 阈值可由配置给到 INT32_MAX，乘系数前必须提升到 64 位并饱和 */
+    int64_t scaled = (int64_t)cfg->detect.threshold * PEER_LIMIT_FACTOR;
     if (scaled > v)
-        v = scaled;
+        v = scaled > INT_MAX ? INT_MAX : (int)scaled;
     if (cfg->memory.low_memory)
         v = cfg->detect.threshold;
     if (cfg->memory.has_peer_limit)

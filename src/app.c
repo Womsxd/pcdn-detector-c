@@ -1,5 +1,6 @@
 #include "app.h"
 
+#include <limits.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
@@ -413,9 +414,9 @@ static void parse_args(int argc, char **argv, const config_t *cfg, cli_overrides
             eff_peer = trigger;
     } else {
         int v = 1000;
-        int scaled = trigger * 10;
+        int64_t scaled = (int64_t)trigger * 10;
         if (scaled > v)
-            v = scaled;
+            v = scaled > INT_MAX ? INT_MAX : (int)scaled;
         if (low)
             v = trigger;
         if (cfg->memory.has_peer_limit)

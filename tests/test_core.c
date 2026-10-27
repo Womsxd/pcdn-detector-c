@@ -386,6 +386,34 @@ static void test_config(void)
     config_free(&c3);
 }
 
+static void test_peer_limit_overflow(void)
+{
+    /* 阈值可由配置给到 INT32_MAX：推导默认对端上限时不得因 int 溢出而变成 0 或负数，
+     * 否则「单端口对端上限」会静默失效、内存不再受控。 */
+    config_t cfg;
+    config_default(&cfg);
+    cfg.detect.threshold = INT32_MAX;
+    int v = config_peer_limit_value(&cfg);
+    CHECK(v > 0);
+    CHECK(v >= cfg.detect.threshold);
+    config_free(&cfg);
+
+    config_default(&cfg);
+    cfg.detect.threshold = INT32_MAX;
+    cfg.memory.low_memory = true;
+    v = config_peer_limit_value(&cfg);
+    CHECK(v > 0);
+    config_free(&cfg);
+
+    config_default(&cfg);
+    cfg.detect.threshold = 1000000000;
+    cfg.memory.has_peer_limit = true;
+    cfg.memory.peer_limit = 500;
+    v = config_peer_limit_value(&cfg);
+    CHECK(v == 500 || v == 1000000000);
+    config_free(&cfg);
+}
+
 static void test_util(void)
 {
     char buf[64];
@@ -455,6 +483,7 @@ int main(void)
     log_set_level(LOG_ERROR);
     test_util();
     test_config();
+    test_peer_limit_overflow();
     test_filter();
     test_detector_alerts();
     test_detector_limits();
