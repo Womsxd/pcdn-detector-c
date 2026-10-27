@@ -10,6 +10,9 @@
 #define STATE_VERSION 1
 #define STATE_HEADER 13
 #define STATE_MAX_U16 65535
+/* 最大合法状态文件约 7.4MiB（65535 × (47+31+23+6+6) + 头），留一点余量到 8MiB。
+ * 上限只用于挡住损坏 / 异常文件，避免在 32MB 内存的设备上触发一次超大分配。 */
+#define STATE_MAX_FILE (8 * 1024 * 1024)
 
 typedef struct {
     uint8_t *p;
@@ -439,7 +442,7 @@ bool state_load(const char *path, state_file **out, char *err, size_t errlen)
         return false;
     }
     long sz = ftell(f);
-    if (sz < 0 || sz > 64 * 1024 * 1024) {
+    if (sz < 0 || sz > STATE_MAX_FILE) {
         fclose(f);
         set_err(err, errlen, "状态文件长度非法");
         return false;

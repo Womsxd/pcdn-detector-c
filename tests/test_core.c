@@ -1,5 +1,6 @@
 /* 核心模块单元测试：配置 / 过滤 / 检测 / 状态文件 */
 #include <assert.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
 
@@ -292,6 +293,22 @@ static void test_state(void)
         state_free(loaded);
     }
     state_remove(path);
+
+    /* 超过 8MiB 的状态文件必须被拒绝，避免损坏文件触发一次超大分配 */
+    char bigpath[256];
+    snprintf(bigpath, sizeof(bigpath), "/tmp/pcdn-detect-test-big-%d.state", (int)getpid());
+    int fd = open(bigpath, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK(ftruncate(fd, 9 * 1024 * 1024) == 0);
+        close(fd);
+        state_file *big = NULL;
+        char berr[256] = {0};
+        CHECK(!state_load(bigpath, &big, berr, sizeof(berr)));
+        CHECK(big == NULL);
+        CHECK(strstr(berr, "长度非法") != NULL);
+        unlink(bigpath);
+    }
 }
 
 static void test_config(void)
