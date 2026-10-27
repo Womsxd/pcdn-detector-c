@@ -136,11 +136,12 @@ endif
 
 # 每种构建组合使用独立的目标文件目录：不同对齐方式 / 不同 libc / PIE 与非 PIE 的 .o
 # 混在一起链接会得到悄悄出错的二进制，物理隔离比事后排查便宜得多。
-# VARIANT 非空时再多一层目录（bin/<variant>/、build/<variant>/），供 script/ 下多套
-# 构建（gcc/zig、静态/动态）并存使用，互不覆盖。
+# VARIANT 非空时再多两层目录（bin/<variant>/、build/<variant>/<arch>/），供 script/ 下
+# 多套构建（gcc/zig、静态/动态）并存使用，互不覆盖。变体目录同样按架构隔离：脚本在一个
+# 目录里连续构建多个架构，缺少架构这一层会让后一个架构复用前一个架构的 .o，链接直接失败。
 PIE_SUFFIX := $(if $(filter 1,$(PIE)),,-nopie)
 OUTDIR     := bin$(if $(VARIANT),/$(VARIANT))
-OBJDIR     := $(if $(VARIANT),build/$(VARIANT)/,$(if $(ARCH),build/$(ARCH),$(if $(filter 1,$(STATIC)),build/static,build/local)))$(PIE_SUFFIX)
+OBJDIR     := $(if $(VARIANT),build/$(VARIANT)$(if $(ARCH),/$(ARCH)),$(if $(ARCH),build/$(ARCH),$(if $(filter 1,$(STATIC)),build/static,build/local)))$(PIE_SUFFIX)
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:src/%.c=$(OBJDIR)/%.o)
