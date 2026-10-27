@@ -31,6 +31,7 @@ struct httpapi {
 };
 
 static time_t g_process_start;
+static pthread_once_t g_process_start_once = PTHREAD_ONCE_INIT;
 
 void reload_result_free(reload_result *r)
 {
@@ -72,10 +73,15 @@ static void json_error(http_response *res, int code, const char *fmt, ...)
     json_send(res, code, root);
 }
 
+static void init_process_start(void)
+{
+    g_process_start = time(NULL);
+}
+
 static int64_t uptime_seconds(void)
 {
-    if (g_process_start == 0)
-        g_process_start = time(NULL);
+    /* 多个请求线程并发读取，初始化必须只做一次且对之后所有读可见 */
+    pthread_once(&g_process_start_once, init_process_start);
     return (int64_t)(time(NULL) - g_process_start);
 }
 
@@ -480,8 +486,7 @@ int httpapi_start(httpapi *a, char *err, size_t errlen)
 {
     if (!a || !a->srv)
         return -1;
-    if (g_process_start == 0)
-        g_process_start = time(NULL);
+    pthread_once(&g_process_start_once, init_process_start);
     return http_server_start(a->srv, err, errlen);
 }
 
