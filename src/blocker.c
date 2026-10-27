@@ -1074,6 +1074,20 @@ void blocker_counts_get(blocker *b, blocker_counts *out)
     pthread_mutex_unlock(&b->mu);
 }
 
+static int cmp_ban_rule_key(const void *pa, const void *pb)
+{
+    const ban_rule_view *a = pa, *b = pb;
+    int c = strcmp(a->mac, b->mac);
+    if (c != 0)
+        return c;
+    if (a->port != b->port)
+        return (int)a->port - (int)b->port;
+    c = strcmp(a->proto, b->proto);
+    if (c != 0)
+        return c;
+    return strcmp(a->family, b->family);
+}
+
 void blocker_ban_index_get(blocker *b, ban_index *out)
 {
     memset(out, 0, sizeof(*out));
@@ -1096,6 +1110,10 @@ void blocker_ban_index_get(blocker *b, ban_index *out)
     }
     set_keys(b->full_banned, &out->full, &out->nfull);
     pthread_mutex_unlock(&b->mu);
+
+    /* 排序后 ban_index_banned 用二分查找：/devices 会对每个端口查一次 */
+    if (out->nrules > 1)
+        qsort(out->rules, out->nrules, sizeof(*out->rules), cmp_ban_rule_key);
 
     if (b->fw) {
         size_t n = 0;
@@ -1144,10 +1162,26 @@ bool ban_index_banned(const ban_index *ix, const char *mac, uint16_t port, const
     const char *family = "";
     if (!ix->both)
         family = v6 ? "v6" : "v4";
-    for (size_t i = 0; i < ix->nrules; i++) {
-        const ban_rule_view *r = &ix->rules[i];
-        if (strcmp(r->mac, mac) == 0 && r->port == port && strcmp(r->proto, proto) == 0 &&
-            strcmp(r->family, family) == 0)
+    /* rules 已按 (mac, port, proto, family) 字典序排好，二分查找 */
+    size_t lo = 0, hi = ix->nrules;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const ban_rule_view *r = &ix->rules[mid];
+        int c = strcmp(r->mac, mac);
+        if (c == 0) {
+            if (r->port != port) {
+                c = r->port < port ? -1 : 1;
+            } else {
+                c = strcmp(r->proto, proto);
+                if (c == 0)
+                    c = strcmp(r->family, family);
+            }
+        }
+        if (c < 0)
+            lo = mid + 1;
+        else if (c > 0)
+            hi = mid;
+        else
             return true;
     }
     return false;

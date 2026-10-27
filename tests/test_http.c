@@ -256,6 +256,18 @@ int main(void)
     CHECK(strstr(body, "\"applied\":[\"detect\"]") != NULL);
     CHECK(atomic_load(&g_reload_calls) == 1);
 
+    /* /devices 只输出聚合计数：1 台设备，v4 两个端口（udp 1 + tcp 1），v6 一个 udp 端口 */
+    run_curl("-H 'Authorization: Bearer secret' http://127.0.0.1:18081/api/v1/devices", body,
+             sizeof(body), headers, sizeof(headers), &status);
+    CHECK(status == 200);
+    CHECK(strstr(body, "\"tracked_devices\":1") != NULL);
+    CHECK(strstr(body, "\"port_evictions\":0") != NULL);
+    CHECK(strstr(body, "\"devices\":[{\"mac\":\"aa:bb:cc:dd:ee:ff\"") != NULL);
+    CHECK(strstr(body, "\"ipv4\":{\"ports\":2,\"banned\":0,\"udp\":{\"ports\":1,\"banned\":0},"
+                       "\"tcp\":{\"ports\":1,\"banned\":0}}") != NULL);
+    CHECK(strstr(body, "\"ipv6\":{\"ports\":1,\"banned\":0,\"udp\":{\"ports\":1,\"banned\":0},"
+                       "\"tcp\":{\"ports\":0,\"banned\":0}}") != NULL);
+
     /* CORS 预检不需要 Authorization */
     run_curl("-X OPTIONS -H 'Origin: https://x.example' -H 'Access-Control-Request-Method: GET' "
              "http://127.0.0.1:18081/api/v1/health",

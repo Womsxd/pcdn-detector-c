@@ -202,8 +202,13 @@ static void test_detector_limits(void)
     detector_device_view_free(&dv);
 
     detector_overview ov;
-    detector_overview_get(d, &ov);
+    detector_overview_get(d, NULL, NULL, &ov);
     CHECK(ov.port_evictions == 1);
+    CHECK(ov.ndevices == 1);
+    /* 淘汰后剩 1001 / 1002 两个 v4 UDP 端口 */
+    CHECK(ov.devices[0].v4.ports == 2);
+    CHECK(ov.devices[0].v4.udp_ports == 2);
+    CHECK(ov.devices[0].v6.ports == 0);
     detector_overview_free(&ov);
     detector_destroy(d);
 }

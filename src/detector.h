@@ -48,27 +48,36 @@ void detector_summary(detector *d);
 /* ---- HTTP API 快照 ---- */
 
 typedef struct {
-    uint16_t port;
-    uint8_t proto;
-    bool v6;
-} port_key_view;
+    int ports;
+    int banned;
+    int udp_ports;
+    int udp_banned;
+    int tcp_ports;
+    int tcp_banned;
+} detector_fam_stat;
 
 typedef struct {
     char mac[18];
-    port_key_view *keys;
-    size_t nkeys;
-} device_port_keys;
+    detector_fam_stat v4;
+    detector_fam_stat v6;
+} detector_device_summary;
+
+/* 由调用方提供“某端口当前是否被封禁”的查询：detector 在锁内遍历端口时回调，
+ * 避免把整份端口列表复制出去再逐个查询。回调必须只读、不加锁。 */
+typedef bool (*detector_banned_fn)(void *ctx, const char *mac, uint16_t port, uint8_t proto,
+                                   bool v6);
 
 typedef struct {
     int tracked_devices;
     int alerts;
     int64_t port_evictions;
     int64_t port_drops;
-    device_port_keys *devices;
+    detector_device_summary *devices;
     size_t ndevices;
 } detector_overview;
 
-void detector_overview_get(detector *d, detector_overview *out);
+void detector_overview_get(detector *d, detector_banned_fn banned_fn, void *ctx,
+                           detector_overview *out);
 void detector_overview_free(detector_overview *ov);
 
 typedef struct {

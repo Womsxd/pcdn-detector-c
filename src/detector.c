@@ -845,55 +845,65 @@ void detector_summary(detector *d)
 /* 快照（HTTP API）                                                    */
 /* ------------------------------------------------------------------ */
 
-static int cmp_device_keys(const void *a, const void *b)
+static int cmp_device_summary(const void *a, const void *b)
 {
-    const device_port_keys *x = a, *y = b;
+    const detector_device_summary *x = a, *y = b;
     return strcmp(x->mac, y->mac);
+}
+
+static void fam_stat_add(detector_fam_stat *s, uint8_t proto, bool banned)
+{
+    s->ports++;
+    if (banned)
+        s->banned++;
+    if (proto == PROTO_TCP) {
+        s->tcp_ports++;
+        if (banned)
+            s->tcp_banned++;
+    } else {
+        s->udp_ports++;
+        if (banned)
+            s->udp_banned++;
+    }
 }
 
 void detector_overview_free(detector_overview *ov)
 {
     if (!ov)
         return;
-    for (size_t i = 0; i < ov->ndevices; i++)
-        free(ov->devices[i].keys);
     free(ov->devices);
     memset(ov, 0, sizeof(*ov));
 }
 
-void detector_overview_get(detector *d, detector_overview *out)
+void detector_overview_get(detector *d, detector_banned_fn banned_fn, void *ctx,
+                           detector_overview *out)
 {
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&d->mu);
-    out->tracked_devices = HASH_COUNT(d->devices);
+    int ndev = HASH_COUNT(d->devices);
+    out->tracked_devices = ndev;
     out->alerts = d->alerts;
     out->port_evictions = d->port_evictions;
     out->port_drops = d->port_drops;
-    size_t n = (size_t)out->tracked_devices;
-    out->devices = n ? xcalloc(n, sizeof(device_port_keys)) : NULL;
+    size_t n = ndev > 0 ? (size_t)ndev : 0;
+    out->devices = n ? xcalloc(n, sizeof(*out->devices)) : NULL;
     out->ndevices = 0;
     for (device *dev = d->devices; dev; dev = dev->hh.next) {
-        device_port_keys *dst = &out->devices[out->ndevices++];
+        detector_device_summary *dst = &out->devices[out->ndevices++];
         mac_format(&dev->mac, dst->mac, sizeof(dst->mac));
-        size_t total = (size_t)device_port_total(dev);
-        dst->keys = total ? xmalloc(total * sizeof(port_key_view)) : NULL;
-        dst->nkeys = 0;
-        for (port_entry *e = dev->v4.head; e; e = e->hh.next) {
-            dst->keys[dst->nkeys].port = e->port;
-            dst->keys[dst->nkeys].proto = e->proto;
-            dst->keys[dst->nkeys].v6 = false;
-            dst->nkeys++;
-        }
-        for (port_entry *e = dev->v6.head; e; e = e->hh.next) {
-            dst->keys[dst->nkeys].port = e->port;
-            dst->keys[dst->nkeys].proto = e->proto;
-            dst->keys[dst->nkeys].v6 = true;
-            dst->nkeys++;
+        for (int pass = 0; pass < 2; pass++) {
+            port_table *t = pass == 0 ? &dev->v4 : &dev->v6;
+            detector_fam_stat *st = pass == 0 ? &dst->v4 : &dst->v6;
+            for (port_entry *e = t->head; e; e = e->hh.next) {
+                bool banned =
+                    banned_fn ? banned_fn(ctx, dst->mac, e->port, e->proto, pass == 1) : false;
+                fam_stat_add(st, e->proto, banned);
+            }
         }
     }
     pthread_mutex_unlock(&d->mu);
     if (out->ndevices > 1)
-        qsort(out->devices, out->ndevices, sizeof(device_port_keys), cmp_device_keys);
+        qsort(out->devices, out->ndevices, sizeof(*out->devices), cmp_device_summary);
 }
 
 void detector_device_view_free(detector_device_view *v)

@@ -585,21 +585,15 @@ static bool parse_bool_param(const char *s, bool *out)
 /* 统计 JSON                                                           */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
-    int ports;
-    int banned;
-    int udp_ports;
-    int udp_banned;
-    int tcp_ports;
-    int tcp_banned;
-} fam_stat;
+/* 与 detector / Go 版的地址族统计同构：/devices 直接用 detector 聚合的结果 */
+typedef detector_fam_stat fam_stat;
 
-static void fam_add(fam_stat *s, const char *proto, bool banned)
+static void fam_add(fam_stat *s, uint8_t proto, bool banned)
 {
     s->ports++;
     if (banned)
         s->banned++;
-    if (strcmp(proto, "tcp") == 0) {
+    if (proto == 6) {
         s->tcp_ports++;
         if (banned)
             s->tcp_banned++;
@@ -668,16 +662,24 @@ static void handle_status(httpapi *a, const http_request *req, http_response *re
     json_send(res, 200, o);
 }
 
+/* detector 在锁内遍历端口时回调：只读 ban_index，不加锁 */
+static bool ban_index_banned_cb(void *ctx, const char *mac, uint16_t port, uint8_t proto,
+                                bool v6)
+{
+    return ban_index_banned(ctx, mac, port, proto == 6 ? "tcp" : "udp", v6);
+}
+
 static void handle_devices(httpapi *a, const http_request *req, http_response *res)
 {
     (void)req;
-    detector_overview ov;
-    detector_overview_get(a->det, &ov);
     blocker *b = get_blocker(a);
     ban_index ix;
     memset(&ix, 0, sizeof(ix));
     if (b)
         blocker_ban_index_get(b, &ix);
+
+    detector_overview ov;
+    detector_overview_get(a->det, b ? ban_index_banned_cb : NULL, &ix, &ov);
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddNumberToObject(o, "tracked_devices", ov.tracked_devices);
@@ -686,20 +688,11 @@ static void handle_devices(httpapi *a, const http_request *req, http_response *r
     cJSON_AddNumberToObject(o, "port_drops", (double)ov.port_drops);
     cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; i < ov.ndevices; i++) {
-        device_port_keys *dp = &ov.devices[i];
-        fam_stat v4, v6;
-        memset(&v4, 0, sizeof(v4));
-        memset(&v6, 0, sizeof(v6));
-        for (size_t k = 0; k < dp->nkeys; k++) {
-            port_key_view *key = &dp->keys[k];
-            const char *proto = proto_label(key->proto);
-            bool banned = ban_index_banned(&ix, dp->mac, key->port, proto, key->v6);
-            fam_add(key->v6 ? &v6 : &v4, proto, banned);
-        }
+        detector_device_summary *dp = &ov.devices[i];
         cJSON *dev = cJSON_CreateObject();
         cJSON_AddStringToObject(dev, "mac", dp->mac);
-        cJSON_AddItemToObject(dev, "ipv4", fam_json(&v4));
-        cJSON_AddItemToObject(dev, "ipv6", fam_json(&v6));
+        cJSON_AddItemToObject(dev, "ipv4", fam_json(&dp->v4));
+        cJSON_AddItemToObject(dev, "ipv6", fam_json(&dp->v6));
         cJSON_AddItemToArray(arr, dev);
     }
     cJSON_AddItemToObject(o, "devices", arr);
@@ -809,7 +802,7 @@ static void handle_device(httpapi *a, const http_request *req, http_response *re
         port_view *p = &dv.ports[i];
         const char *proto = proto_label(p->proto);
         bool banned = ban_index_banned(&ix, norm, p->port, proto, p->v6);
-        fam_add(p->v6 ? &v6 : &v4, proto, banned);
+        fam_add(p->v6 ? &v6 : &v4, p->proto, banned);
         if (fam_filter == 1 && p->v6)
             continue;
         if (fam_filter == 2 && !p->v6)
