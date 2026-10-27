@@ -33,7 +33,9 @@
 #define DEFAULT_CORS_MAX_AGE 600
 #define STATE_FILE_NAME "pcdn-detect.state"
 #define TOKEN_ALLOW_NO_TOKEN "allow-no-token"
-#define PAGE_SIZE 4096
+/* 与 Go 版 internal/config/defaults.go 的 pageSize = 4096 保持一致。
+ * 不能叫 PAGE_SIZE：musl 的 <limits.h> 也定义了 PAGE_SIZE，会触发宏重定义警告。 */
+#define RING_PAGE_SIZE 4096
 
 static const char *const config_candidates[] = {"config.toml", "pcdn-detect.toml"};
 static const char *const config_create_names[] = {"pcdn-detect.toml"};
@@ -268,7 +270,7 @@ void config_ring_params(const config_t *cfg, int *frame, int *block, int *blocks
     int f = cfg->capture.frame_size;
     int b = cfg->capture.block_size;
     int n = cfg->capture.num_blocks;
-    if (f <= 0 || b <= 0 || n < 1 || b % PAGE_SIZE != 0 || b % f != 0) {
+    if (f <= 0 || b <= 0 || n < 1 || b % RING_PAGE_SIZE != 0 || b % f != 0) {
         *frame = DEFAULT_FRAME_SIZE;
         *block = DEFAULT_BLOCK_SIZE;
         *blocks = DEFAULT_NUM_BLOCKS;
