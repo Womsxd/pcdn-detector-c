@@ -11,6 +11,9 @@
 #define PROTO_UDP "udp"
 #define PROTO_TCP "tcp"
 #define PROTO_UDP_ID 17
+
+/* IPv6 文本最长 45 字节（含 NUL 46），ban_state 与格式化缓冲统一用它 */
+#define IPS_TEXT_MAX 46
 #define PROTO_TCP_ID 6
 
 /* 队列元素只存二进制地址：256 项 × 28B = 7KiB（原来是 × 90B ≈ 23KiB）。
@@ -23,11 +26,13 @@ typedef struct {
     bool ban;
 } block_event;
 
+/* key 实际最长 "aa:bb:cc:dd:ee:ff:65535:udp:v6" = 30B，ips 最长 IPv6 文本 45B：
+ * 收紧后整条约 232B（glibc chunk 240，原 320B → 336），封禁条目多时收益明显。 */
 typedef struct ban_state {
-    char key[96];
+    char key[48];
     char mac[18];
     char proto[4];
-    char ips[2][64];
+    char ips[2][IPS_TEXT_MAX];
     uint16_t port;
     uint32_t refs[2];
     uint8_t fam;
@@ -500,7 +505,7 @@ static void enqueue(blocker *b, const block_event *ev)
 
 static void handle_event(blocker *b, const block_event *ev)
 {
-    char macstr[18], ipstr[64];
+    char macstr[18], ipstr[IPS_TEXT_MAX];
     mac_format(&ev->mac, macstr, sizeof(macstr));
     ip_format(&ev->ip, ipstr, sizeof(ipstr));
     const char *ev_proto = proto_name(ev->proto);
@@ -940,7 +945,7 @@ void blocker_force_unban(blocker *b, const char *mac, uint16_t port, const char 
     }
 
     typedef struct {
-        char ip[64];
+        char ip[IPS_TEXT_MAX];
         char proto[4];
     } target;
     target *targets = NULL;
@@ -1316,7 +1321,7 @@ void blocker_restore(blocker *b, const state_file *st)
 
     for (size_t i = 0; i < st->nbans; i++) {
         const state_ban *e = &st->bans[i];
-        char mac[18], ip[64], proto[4], key[96];
+        char mac[18], ip[IPS_TEXT_MAX], proto[4], key[96];
         mac_format(&e->mac, mac, sizeof(mac));
         ip_format(&e->ip, ip, sizeof(ip));
         snprintf(proto, sizeof(proto), "%s", e->proto == 6 ? PROTO_TCP : PROTO_UDP);
