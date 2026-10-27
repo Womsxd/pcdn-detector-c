@@ -220,6 +220,14 @@ int main(void)
     CHECK(strstr(body, "\"1.1.1.1\"") != NULL);
     CHECK(strstr(body, "\"2.2.2.2\"") != NULL);
 
+    /* IPv6 端口走 keylen=16 的对端 key 路径 */
+    run_curl("-H 'Authorization: Bearer secret' "
+             "'http://127.0.0.1:18081/api/v1/peers?mac=aa:bb:cc:dd:ee:ff&port=40002&v6=true'",
+             body, sizeof(body), headers, sizeof(headers), &status);
+    CHECK(status == 200);
+    CHECK(strstr(body, "\"peer_count\":1") != NULL);
+    CHECK(strstr(body, "\"2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3\"") != NULL);
+
     run_curl("-H 'Authorization: Bearer secret' http://127.0.0.1:18081/api/v1/blocks", body,
              sizeof(body), headers, sizeof(headers), &status);
     CHECK(status == 200);

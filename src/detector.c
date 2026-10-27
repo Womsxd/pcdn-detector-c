@@ -20,11 +20,14 @@
 /* 数据结构                                                            */
 /* ------------------------------------------------------------------ */
 
+/* key 用柔性数组：IPv4 对端只需 4B（原来固定 16B，白占 12B）。
+ * 字段顺序刻意让 key 紧跟 reported，使 IPv4 分配为 65+4=69B，落在 80B 的 size class；
+ * 若把 uthash 句柄放在最后，总量会跨回 96B 档，等于没省。 */
 typedef struct peer_entry {
-    uint8_t key[16];
     int64_t last_seen_ns;
-    bool reported;
     UT_hash_handle hh;
+    bool reported;
+    uint8_t key[];
 } peer_entry;
 
 typedef struct {
@@ -115,10 +118,10 @@ static peer_entry *peer_touch(peer_set *s, const uint8_t *key, int64_t ts)
         e->last_seen_ns = ts;
         return e;
     }
-    e = xcalloc(1, sizeof(*e));
+    e = xcalloc(1, offsetof(peer_entry, key) + s->keylen);
     memcpy(e->key, key, s->keylen);
     e->last_seen_ns = ts;
-    HASH_ADD(hh, s->head, key, (unsigned)s->keylen, e);
+    HASH_ADD_KEYPTR(hh, s->head, e->key, (unsigned)s->keylen, e);
     s->count++;
     if (s->count > s->peak)
         s->peak = s->count;
@@ -224,7 +227,7 @@ static void peer_compact(peer_set *s)
     s->head = NULL;
     for (i = 0; i < n; i++) {
         memset(&items[i]->hh, 0, sizeof(items[i]->hh));
-        HASH_ADD(hh, s->head, key, (unsigned)s->keylen, items[i]);
+        HASH_ADD_KEYPTR(hh, s->head, items[i]->key, (unsigned)s->keylen, items[i]);
     }
     free(items);
     s->peak = s->count;
