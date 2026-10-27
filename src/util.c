@@ -95,11 +95,20 @@ void sb_reset(strbuf *sb)
 
 static void sb_reserve(strbuf *sb, size_t extra)
 {
-    if (sb->n + extra + 1 <= sb->cap)
+    /* 长度来自配置 / HTTP 体等外部输入：先排除 size_t 溢出，避免退化为小缓冲区 */
+    if (extra >= SIZE_MAX - sb->n)
+        log_fatal("字符串缓冲长度溢出（当前 %zu，追加 %zu）", sb->n, extra);
+    size_t need = sb->n + extra + 1;
+    if (need <= sb->cap)
         return;
     size_t cap = sb->cap ? sb->cap : 64;
-    while (cap < sb->n + extra + 1)
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
         cap *= 2;
+    }
     sb->p = xrealloc(sb->p, cap);
     sb->cap = cap;
 }
