@@ -511,6 +511,11 @@ static void handle_frame(capturer *c, const uint8_t *data, size_t caplen, int wi
 
     if (caplen < l4off + 4)
         return;
+    /* IPv6 扩展头在 BPF 里一律放行，解析出真正的上层协议后需再次确认它与
+     * 抓包协议一致，否则 protocol = "udp"/"tcp" 时会把另一种协议也计入统计。 */
+    if ((c->protocol_mode == 1 && proto != PROTO_TCP) ||
+        (c->protocol_mode == 0 && proto != PROTO_UDP))
+        return;
     uint16_t src_port = (uint16_t)((data[l4off] << 8) | data[l4off + 1]);
     uint16_t dst_port = (uint16_t)((data[l4off + 2] << 8) | data[l4off + 3]);
     if (proto != PROTO_TCP && proto != PROTO_UDP)
