@@ -1372,6 +1372,9 @@ bool blocker_block_state(blocker *b, state_file *out, char *err, size_t errlen)
     return true;
 }
 
+/* 按状态还原并重新下发封禁（启动继承 / 防火墙迁移时调用，使用当前防火墙后端）。
+ * UPnP 的静态策略（名单 / 全量拦截）不在这里恢复：blocker_create 已按当前配置应用，
+ * 旧状态文件中已撤销的权限不应被重新下发。 */
 void blocker_restore(blocker *b, const state_file *st)
 {
     if (!b || !st || !b->fw)
@@ -1479,31 +1482,6 @@ void blocker_restore(blocker *b, const state_file *st)
             pthread_mutex_lock(&b->mu);
             set_del(&b->full_banned, mac);
             pthread_mutex_unlock(&b->mu);
-        }
-    }
-
-    for (size_t i = 0; i < st->nupnp_blocked; i++) {
-        char mac[18];
-        mac_format(&st->upnp_blocked[i], mac, sizeof(mac));
-        apply_upnp_ban(b, true, mac);
-    }
-    for (size_t i = 0; i < st->nupnp_allowed; i++) {
-        char mac[18];
-        mac_format(&st->upnp_allowed[i], mac, sizeof(mac));
-        apply_upnp_allow(b, true, mac);
-    }
-    if (st->upnp_all) {
-        pthread_mutex_lock(&b->mu);
-        bool already = b->upnp_all;
-        pthread_mutex_unlock(&b->mu);
-        if (!already) {
-            if (firewall_upnp_block_all(b->fw) != 0) {
-                log_error("继承 UPnP 全量拦截失败");
-            } else {
-                pthread_mutex_lock(&b->mu);
-                b->upnp_all = true;
-                pthread_mutex_unlock(&b->mu);
-            }
         }
     }
 
