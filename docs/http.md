@@ -271,6 +271,8 @@ kill -HUP <pid>
 | `[http] token` / `device_ip_limit` | `http.token` / `http.device_ip_limit` | HTTP 服务原地更新（`device_ip_limit` 自下一次 `/peers` 请求起生效） |
 | `[http] cors_*` | `http.cors` | CORS 策略原地更新，自下一次请求起生效 |
 
+HTTP 新监听实际绑定成功后才报告重载成功。绑定失败时保留旧服务；同端口地址重叠、必须先释放旧监听时，失败会尝试恢复旧监听。无效端口（负数或超过 65535）会在配置预检时拒绝。
+
 > `[capture] protocol` 变化时，若 `[firewall] enabled = true`，防火墙会**一并原地重建**：
 > 封禁协议与 nftables 预建集合（`<set>_<family>_<proto>`）都由它决定，不重建会导致新协议
 > （如 `udp` → `all` 后的 TCP）的封禁命令因集合不存在而失败。

@@ -778,16 +778,17 @@ static void restore_state(app_t *a)
     free(path);
 }
 
-static int app_start_http(app_t *a, const config_t *cfg, char *err, size_t errlen)
+/* 创建并启动一个 HTTP 服务实例（不改动 app 现有状态）：httpapi_create 会立即
+ * 绑定监听地址，绑定失败时返回 NULL。 */
+static httpapi *http_launch(app_t *a, const config_t *cfg, char *err, size_t errlen)
 {
     httpapi *api = httpapi_create(a->det, a->blk, cfg, app_reload, a, err, errlen);
     if (!api)
-        return -1;
+        return NULL;
     if (httpapi_start(api, err, errlen) != 0) {
         httpapi_free(api);
-        return -1;
+        return NULL;
     }
-    a->api = api;
     const char *auth = "无鉴权";
     if (config_http_bearer_token(cfg)[0] != '\0')
         auth = "Bearer 鉴权";
@@ -795,6 +796,15 @@ static int app_start_http(app_t *a, const config_t *cfg, char *err, size_t errle
         auth = "无鉴权（token = allow-no-token）";
     log_info("HTTP API 已启用：http://%s（%s；/peers 每端口对端 IP 上限 %d）",
              config_http_listen(cfg), auth, config_device_ip_limit(cfg));
+    return api;
+}
+
+static int app_start_http(app_t *a, const config_t *cfg, char *err, size_t errlen)
+{
+    httpapi *api = http_launch(a, cfg, err, errlen);
+    if (!api)
+        return -1;
+    a->api = api;
     return 0;
 }
 
@@ -805,6 +815,46 @@ static void app_stop_http(app_t *a)
         httpapi_free(a->api);
         a->api = NULL;
     }
+}
+
+static const char *listen_port(const char *listen)
+{
+    const char *colon = listen ? strrchr(listen, ':') : NULL;
+    return colon ? colon + 1 : "";
+}
+
+/* 原地切换 HTTP 监听：新监听实际绑定成功后才算成功，失败时保留 / 恢复旧服务。
+ * 地址能同时存在时先起新服务；端口相同（含同一地址）时必须先释放旧监听再重试。 */
+static int app_restart_http(app_t *a, const config_t *oldcfg, const config_t *newcfg, char *err,
+                            size_t errlen)
+{
+    char nerr[512] = {0};
+    httpapi *napi = http_launch(a, newcfg, nerr, sizeof(nerr));
+    if (napi) {
+        app_stop_http(a);
+        a->api = napi;
+        return 0;
+    }
+    if (strcmp(listen_port(config_http_listen(oldcfg)), listen_port(config_http_listen(newcfg))) !=
+        0) {
+        set_err(err, errlen, "重启 HTTP 监听失败：%s", nerr);
+        return -1;
+    }
+    app_stop_http(a);
+    char retry_err[512] = {0};
+    napi = http_launch(a, newcfg, retry_err, sizeof(retry_err));
+    if (napi) {
+        a->api = napi;
+        return 0;
+    }
+    char rerr[512] = {0};
+    if (app_start_http(a, oldcfg, rerr, sizeof(rerr)) != 0)
+        set_err(err, errlen, "重启 HTTP 监听失败：%s；恢复旧监听 %s 失败：%s", retry_err,
+                config_http_listen(oldcfg), rerr);
+    else
+        set_err(err, errlen, "重启 HTTP 监听失败：%s（已恢复旧监听 %s）", retry_err,
+                config_http_listen(oldcfg));
+    return -1;
 }
 
 static void app_retire_blocker(app_t *a, blocker *b)
@@ -1122,14 +1172,14 @@ static int app_reload(void *ctx, reload_result *res, char *err, size_t errlen)
             rc = 0;
             goto out;
         }
-        app_stop_http(a);
         if (nc.http.enabled) {
             char herr[512] = {0};
-            if (app_start_http(a, &nc, herr, sizeof(herr)) != 0) {
-                set_err(err, errlen, "重启 HTTP 监听失败：%s", herr);
+            if (app_restart_http(a, &a->cfg, &nc, herr, sizeof(herr)) != 0) {
+                set_err(err, errlen, "%s", herr);
                 goto out;
             }
         } else {
+            app_stop_http(a);
             log_info("HTTP API 已关闭");
         }
         reload_add(&res->applied, &res->napplied, "http");
