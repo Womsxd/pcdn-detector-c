@@ -17,6 +17,7 @@ struct device_filter {
     port_rule *whitelist;
     size_t nblack;
     size_t nwhite;
+    int refs; /* 由持有方在各自锁内改写，见 filter_ref / filter_free */
 };
 
 /* 解析 "MAC" 或 "MAC:端口表达式"（MAC 恰好 6 段，第 7 段起为端口表达式） */
@@ -132,6 +133,7 @@ bool filter_create(const char *mode, char **blacklist, size_t nblack, char **whi
 {
     *out = NULL;
     device_filter *f = xcalloc(1, sizeof(*f));
+    f->refs = 1;
     snprintf(f->mode, sizeof(f->mode), "%s", mode ? mode : "whitelist");
 
     for (size_t i = 0; i < nblack; i++) {
@@ -214,9 +216,17 @@ void filter_describe(const device_filter *f, char *buf, size_t cap)
              exact);
 }
 
+void filter_ref(device_filter *f)
+{
+    if (f)
+        __atomic_add_fetch(&f->refs, 1, __ATOMIC_RELAXED);
+}
+
 void filter_free(device_filter *f)
 {
     if (!f)
+        return;
+    if (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0)
         return;
     port_rule *r, *tmp;
     HASH_ITER(hh, f->blacklist, r, tmp)

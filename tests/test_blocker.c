@@ -5,6 +5,7 @@
 
 #include "blocker.h"
 #include "config.h"
+#include "filter.h"
 #include "firewall.h"
 #include "util.h"
 
@@ -112,6 +113,25 @@ int main(void)
     sink->on_alert_end(ctx, mac, "2408:8240:9411:37b0:4e9:adaa:3a1a:b2a3", 40003, "tcp");
     CHECK(wait_counts(b, 0, 0, 0, 2000));
 
+    /* 名单热重载：已排除的端口不再封禁，已有封禁立即撤销 */
+    char *wl[] = {"aa:bb:cc:dd:ee:ff:40010"};
+    device_filter *flt = NULL;
+    CHECK(filter_create("whitelist", NULL, 0, wl, 1, &flt, err, sizeof(err)));
+    blocker_set_filter(b, flt);
+    sink->on_alert_start(ctx, mac, ip, 40010, "udp");
+    CHECK(wait_counts(b, 0, 0, 0, 2000));
+
+    sink->on_alert_start(ctx, mac, ip, 40011, "udp");
+    CHECK(wait_counts(b, 1, 0, 1, 2000));
+
+    char *wl2[] = {"aa:bb:cc:dd:ee:ff:40011"};
+    device_filter *flt2 = NULL;
+    CHECK(filter_create("whitelist", NULL, 0, wl2, 1, &flt2, err, sizeof(err)));
+    blocker_set_filter(b, flt2);
+    filter_free(flt);
+    CHECK(wait_counts(b, 0, 0, 0, 2000));
+    filter_free(flt2);
+
     /* 手动解封 */
     sink->on_alert_start(ctx, mac, ip, 40002, "udp");
     CHECK(wait_counts(b, 1, 0, 1, 2000));
@@ -140,11 +160,23 @@ int main(void)
     CHECK(wait_counts(b2, 1, 0, 1, 2000));
     blocker_close(b2);
     blocker_free(b2);
+
+    /* 恢复状态时同样按当前名单过滤：已排除端口不再恢复封禁 */
+    char *wl3[] = {"aa:bb:cc:dd:ee:ff:40004"};
+    device_filter *flt3 = NULL;
+    CHECK(filter_create("whitelist", NULL, 0, wl3, 1, &flt3, err, sizeof(err)));
+    blocker *b3 = blocker_create(fw, false, &fb, &up);
+    blocker_set_filter(b3, flt3);
+    blocker_restore(b3, st);
+    CHECK(wait_counts(b3, 0, 0, 0, 2000));
+    blocker_close(b3);
+    blocker_free(b3);
+    filter_free(flt3);
     state_free(st);
 
     int lines = 0;
     bool saw_port_ban = false, saw_full_ban = false, saw_full_unban = false,
-         saw_port_unban = false;
+         saw_port_unban = false, saw_filter_unban = false;
     f = fopen(out, "r");
     if (f) {
         char line[512];
@@ -158,6 +190,8 @@ int main(void)
                 saw_full_unban = true;
             if (strstr(line, "p unban aa:bb:cc:dd:ee:ff 1.2.3.4 40000 v4 udp"))
                 saw_port_unban = true;
+            if (strstr(line, "p unban aa:bb:cc:dd:ee:ff 1.2.3.4 40011 v4 udp"))
+                saw_filter_unban = true;
         }
         fclose(f);
     }
@@ -166,6 +200,7 @@ int main(void)
     CHECK(saw_full_ban);
     CHECK(saw_full_unban);
     CHECK(saw_port_unban);
+    CHECK(saw_filter_unban);
 
     firewall_cleanup(fw);
     firewall_free(fw);

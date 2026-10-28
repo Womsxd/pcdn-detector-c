@@ -624,6 +624,7 @@ detector *detector_create(int threshold, int64_t window, int64_t alert_duration,
     d->threshold = threshold;
     d->window = window;
     d->alert_duration = alert_duration;
+    filter_ref(filter);
     d->filter = filter;
     d->hide = hide;
     d->low_memory = low_memory;
@@ -694,11 +695,43 @@ void detector_set_max_ports(detector *d, int limit)
     pthread_mutex_unlock(&d->mu);
 }
 
+/* 名单热重载后清理新名单已排除的端口：撤销对应告警（通知 sink，交由 blocker
+ * 解封）并丢弃检测状态，避免已排除的端口继续告警 / 被封禁到自然过期。 */
+static void prune_filtered_table(detector *d, device *dev, port_table *t, bool v6)
+{
+    port_entry *e, *tmp;
+    HASH_ITER(hh, t->head, e, tmp)
+    {
+        if (filter_allow_key(d->filter, dev->mac, e->port))
+            continue;
+        if (e->stat->alert_start_ns != 0 && d->sink && d->sink->on_alert_end) {
+            char macbuf[32], ipbuf[64];
+            mac_format(&dev->mac, macbuf, sizeof(macbuf));
+            pcdn_ip ip = stat_device_ip(e->stat, v6);
+            ip_format(&ip, ipbuf, sizeof(ipbuf));
+            d->sink->on_alert_end(d->sink_ctx, macbuf, ipbuf, e->port, proto_name(e->proto));
+        }
+        port_remove(t, e);
+    }
+}
+
+static void prune_filtered_ports(detector *d)
+{
+    device *dev, *tmp;
+    HASH_ITER(hh, d->devices, dev, tmp)
+    {
+        prune_filtered_table(d, dev, &dev->v4, false);
+        prune_filtered_table(d, dev, &dev->v6, true);
+    }
+}
+
 void detector_set_filter(detector *d, device_filter *filter)
 {
+    filter_ref(filter);
     pthread_mutex_lock(&d->mu);
     device_filter *old = d->filter;
     d->filter = filter;
+    prune_filtered_ports(d);
     pthread_mutex_unlock(&d->mu);
     filter_free(old);
 }
@@ -1072,6 +1105,8 @@ void detector_restore_sessions(detector *d, const state_session *sessions, size_
     pthread_mutex_lock(&d->mu);
     for (size_t i = 0; i < n; i++) {
         const state_session *s = &sessions[i];
+        if (!filter_allow_key(d->filter, s->mac, s->port))
+            continue;
         device *dev = device_get(d, s->mac);
         port_table *t = s->v6 ? &dev->v6 : &dev->v4;
         port_entry *e = port_find(t, s->port, s->proto);

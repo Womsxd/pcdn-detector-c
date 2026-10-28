@@ -66,6 +66,8 @@ typedef struct {
     firewall *fw;
     blocker *blk;
     httpapi *api;
+    /* 当前生效的名单：app / detector / blocker 各持一份引用，热重载时整体替换 */
+    device_filter *flt;
     int peer_limit;
     pthread_mutex_t interval_mu;
     int64_t interval;
@@ -916,6 +918,36 @@ static int app_reload(void *ctx, reload_result *res, char *err, size_t errlen)
     if (a->det)
         detector_alert_sessions(a->det, &snap->sessions, &snap->nsessions);
 
+    /* 0) 名单：先于防火墙迁移与抓包重配应用，使新名单已排除端口的告警与封禁
+     *    先被清理，随后（若需要）重建 blocker 时也不会按旧状态恢复它们。 */
+    if (!config_filter_equal(&a->cfg.filter, &nc.filter)) {
+        char **black = NULL, **white = NULL;
+        size_t nb = 0, nw = 0;
+        char ferr[512] = {0};
+        device_filter *nf = NULL;
+        if (!config_list_entries(&nc, &black, &nb, &white, &nw, ferr, sizeof(ferr)) ||
+            !filter_create(nc.filter.list_mode, black, nb, white, nw, &nf, ferr,
+                           sizeof(ferr))) {
+            log_warn("警告：名单配置错误，已保持原名单：%s", ferr);
+        } else {
+            if (a->blk)
+                blocker_set_filter(a->blk, nf);
+            detector_set_filter(a->det, nf);
+            filter_free(a->flt);
+            a->flt = nf;
+            char desc[512];
+            filter_describe(nf, desc, sizeof(desc));
+            log_info("名单已热更新：%s", desc);
+            reload_add(&res->applied, &res->napplied, "filter");
+        }
+        for (size_t i = 0; i < nb; i++)
+            free(black[i]);
+        for (size_t i = 0; i < nw; i++)
+            free(white[i]);
+        free(black);
+        free(white);
+    }
+
     /* 1) 抓包原地重配 */
     if (!config_capture_equal(&a->cfg.capture, &nc.capture)) {
         if (!a->cap) {
@@ -1003,6 +1035,8 @@ static int app_reload(void *ctx, reload_result *res, char *err, size_t errlen)
             blocker *nblk = blocker_create(nfw, nc.log.hide_address, &fb, &up);
             free_str_array(fb.devices, fb.ndevices);
             free_str_array(up.targets, up.ntargets);
+            /* 先挂上当前（新）名单，恢复状态时就会跳过已排除的端口 */
+            blocker_set_filter(nblk, a->flt);
             blocker_restore(nblk, snap);
             a->fw = nfw;
             a->blk = nblk;
@@ -1095,29 +1129,6 @@ static int app_reload(void *ctx, reload_result *res, char *err, size_t errlen)
         if (a->blk)
             blocker_set_hide(a->blk, nc.log.hide_address);
         reload_add(&res->applied, &res->napplied, "log.hide_address");
-    }
-    if (!config_filter_equal(&a->cfg.filter, &nc.filter)) {
-        char **black = NULL, **white = NULL;
-        size_t nb = 0, nw = 0;
-        char ferr[512] = {0};
-        device_filter *nf = NULL;
-        if (!config_list_entries(&nc, &black, &nb, &white, &nw, ferr, sizeof(ferr)) ||
-            !filter_create(nc.filter.list_mode, black, nb, white, nw, &nf, ferr,
-                           sizeof(ferr))) {
-            log_warn("警告：名单配置错误，已保持原名单：%s", ferr);
-        } else {
-            detector_set_filter(a->det, nf);
-            char desc[512];
-            filter_describe(nf, desc, sizeof(desc));
-            log_info("名单已热更新：%s", desc);
-            reload_add(&res->applied, &res->napplied, "filter");
-        }
-        for (size_t i = 0; i < nb; i++)
-            free(black[i]);
-        for (size_t i = 0; i < nw; i++)
-            free(white[i]);
-        free(black);
-        free(white);
     }
     if (a->api) {
         if (strcmp(config_http_bearer_token(&a->cfg), config_http_bearer_token(&nc)) != 0) {
@@ -1248,6 +1259,7 @@ static void app_free(app_t *a)
     free(a->retired_fw);
     if (a->det)
         detector_destroy(a->det);
+    filter_free(a->flt);
     if (a->cap)
         capturer_destroy(a->cap);
     config_free(&a->cfg);
@@ -1324,6 +1336,7 @@ int app_main(int argc, char **argv)
         log_warn("提示：gc_percent 仅 Go 版本生效，C 版本已忽略（%d）", a.cfg.memory.gc_percent);
 
     device_filter *flt = setup_filter(&a.cfg);
+    a.flt = flt;
     a.det = detector_create(a.cfg.detect.threshold, a.cfg.detect.window,
                             a.cfg.detect.alert_duration, flt, a.cfg.log.hide_address,
                             a.cfg.memory.low_memory, a.peer_limit,
@@ -1349,6 +1362,7 @@ int app_main(int argc, char **argv)
     if (a.blk) {
         void *sink_ctx = NULL;
         const alert_sink *sink = blocker_alert_sink(a.blk, &sink_ctx);
+        blocker_set_filter(a.blk, a.flt);
         detector_set_sink(a.det, sink, sink_ctx);
     }
     restore_state(&a);

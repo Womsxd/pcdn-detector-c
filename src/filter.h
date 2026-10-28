@@ -11,6 +11,10 @@ bool filter_create(const char *mode, char **blacklist, size_t nblack, char **whi
 bool filter_allow_key(const device_filter *f, pcdn_mac mac, uint16_t port);
 bool filter_is_empty(const device_filter *f);
 void filter_describe(const device_filter *f, char *buf, size_t cap);
-void filter_free(device_filter *f);
+
+/* 引用计数：detector、blocker 与 app 可能同时持有同一份名单（热重载后旧名单
+ * 仍被 worker 线程使用），各自持有一份引用，最后一份释放时才真正销毁。 */
+void filter_ref(device_filter *f);
+void filter_free(device_filter *f); /* 释放一份引用；引用归零时销毁 */
 
 #endif

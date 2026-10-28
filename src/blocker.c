@@ -92,6 +92,10 @@ struct blocker {
     int fb_threshold;
     str_set *fb_devices;
 
+    /* 当前名单（持有一份引用）：热重载后新名单已排除的端口不再封禁，
+     * 已存在的封禁由 blocker_set_filter 解封。 */
+    device_filter *filter;
+
     bool up_enabled;
     bool up_block_all;
     str_set *up_targets;
@@ -277,8 +281,8 @@ static int dev_port_count_locked(blocker *b, const char *mac)
 /* 日志 / 下发                                                         */
 /* ------------------------------------------------------------------ */
 
-static void apply_one(blocker *b, bool ban, const char *mac, const char *ip, uint16_t port,
-                      const char *proto)
+static int apply_one(blocker *b, bool ban, const char *mac, const char *ip, uint16_t port,
+                     const char *proto)
 {
     char mb[64], ib[64];
     fmt_masked(atomic_load(&b->hide), mac, ip, mb, sizeof(mb), ib, sizeof(ib));
@@ -290,9 +294,10 @@ static void apply_one(blocker *b, bool ban, const char *mac, const char *ip, uin
                  : firewall_unban(b->fw, mac, ip, port, proto);
     if (rc != 0) {
         log_error("%s设备 %s(%s) 的 %s 端口 %d 失败", ban ? "封禁" : "解封", mb, ib, label, port);
-        return;
+        return -1;
     }
     log_info("已%s设备 %s(%s) 的 %s 端口 %d", ban ? "封禁" : "解封", mb, ib, label, port);
+    return 0;
 }
 
 static void apply_full(blocker *b, bool ban, const char *mac, const char *ip);
@@ -518,6 +523,11 @@ static void handle_event(blocker *b, const block_event *ev)
                  firewall_addr_family(ipstr));
 
     pthread_mutex_lock(&b->mu);
+    /* 名单已排除的端口不再下发封禁（解封事件照常处理，避免旧封禁残留）。 */
+    if (ev->ban && !filter_allow_key(b->filter, ev->mac, ev->port)) {
+        pthread_mutex_unlock(&b->mu);
+        return;
+    }
     ban_state *st = NULL;
     HASH_FIND_STR(b->active, key, st);
     if (ev->ban) {
@@ -892,10 +902,79 @@ void blocker_set_hide(blocker *b, bool hide)
         atomic_store(&b->hide, hide);
 }
 
+/* 热替换名单：新名单已排除的设备 / 端口会被解封并清出内存状态，
+ * 同时后续封禁事件也按新名单过滤（见 handle_event）。 */
+void blocker_set_filter(blocker *b, device_filter *f)
+{
+    if (!b)
+        return;
+    filter_ref(f);
+
+    typedef struct {
+        char key[96];
+        char mac[18];
+        char ip[64];
+        char proto[4];
+        uint16_t port;
+        bool applied;
+    } victim;
+
+    pthread_mutex_lock(&b->mu);
+    device_filter *old = b->filter;
+    b->filter = f;
+    victim *victims = NULL;
+    size_t n = 0;
+    for (ban_state *st = b->active; st; st = st->hh.next) {
+        pcdn_mac mac;
+        char perr[64];
+        if (!mac_parse(st->mac, &mac, perr, sizeof(perr)))
+            continue;
+        if (filter_allow_key(f, mac, st->port))
+            continue;
+        victims = xrealloc(victims, (n + 1) * sizeof(*victims));
+        snprintf(victims[n].key, sizeof(victims[n].key), "%s", st->key);
+        snprintf(victims[n].mac, sizeof(victims[n].mac), "%s", st->mac);
+        snprintf(victims[n].ip, sizeof(victims[n].ip), "%s", state_ip(st));
+        snprintf(victims[n].proto, sizeof(victims[n].proto), "%s", st->proto);
+        victims[n].port = st->port;
+        victims[n].applied = st->applied;
+        n++;
+    }
+    pthread_mutex_unlock(&b->mu);
+    filter_free(old);
+
+    /* 先解封再清记录；解封失败时保留记录，下一次重载或自然过期可重试 */
+    for (size_t i = 0; i < n; i++) {
+        if (victims[i].applied && apply_one(b, false, victims[i].mac, victims[i].ip,
+                                            victims[i].port, victims[i].proto) != 0)
+            continue;
+        pthread_mutex_lock(&b->mu);
+        ban_state *st = NULL;
+        HASH_FIND_STR(b->active, victims[i].key, st);
+        if (st) {
+            HASH_DEL(b->active, st);
+            free(st);
+            bump_port_locked(b, victims[i].mac, victims[i].port, -1);
+        }
+        pthread_mutex_unlock(&b->mu);
+    }
+
+    /* 端口数下降后可能需要解除全端口封禁（按设备去重后各评估一次） */
+    for (size_t i = 0; i < n; i++) {
+        bool dup = false;
+        for (size_t j = 0; j < i && !dup; j++)
+            dup = strcmp(victims[j].mac, victims[i].mac) == 0;
+        if (!dup)
+            maybe_full_ban(b, victims[i].mac, victims[i].ip);
+    }
+    free(victims);
+}
+
 void blocker_free(blocker *b)
 {
     if (!b)
         return;
+    filter_free(b->filter);
     set_free(&b->full_banned);
     set_free(&b->upnp_blocked);
     set_free(&b->upnp_allowed);
@@ -1303,6 +1382,8 @@ void blocker_restore(blocker *b, const state_file *st)
     for (size_t i = 0; i < st->nbans; i++) {
         char mac[18], key[32];
         mac_format(&st->bans[i].mac, mac, sizeof(mac));
+        if (!filter_allow_key(b->filter, st->bans[i].mac, st->bans[i].port))
+            continue;
         make_port_key(mac, st->bans[i].port, key, sizeof(key));
         set_add(&mac_ports, key);
     }
@@ -1322,6 +1403,8 @@ void blocker_restore(blocker *b, const state_file *st)
     for (size_t i = 0; i < st->nbans; i++) {
         const state_ban *e = &st->bans[i];
         char mac[18], ip[IPS_TEXT_MAX], proto[4], key[96];
+        if (!filter_allow_key(b->filter, e->mac, e->port))
+            continue;
         mac_format(&e->mac, mac, sizeof(mac));
         ip_format(&e->ip, ip, sizeof(ip));
         snprintf(proto, sizeof(proto), "%s", e->proto == 6 ? PROTO_TCP : PROTO_UDP);

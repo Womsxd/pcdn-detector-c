@@ -29,6 +29,10 @@ void blocker_close(blocker *b);
 void blocker_free(blocker *b);
 void blocker_set_hide(blocker *b, bool hide);
 
+/* 热替换名单（内部持有一份引用，可反复调用）：解封并清出新名单已排除的
+ * 端口封禁，后续封禁事件也按新名单过滤。 */
+void blocker_set_filter(blocker *b, device_filter *filter);
+
 const alert_sink *blocker_alert_sink(blocker *b, void **ctx);
 
 void blocker_force_unban(blocker *b, const char *mac, uint16_t port, const char *proto,

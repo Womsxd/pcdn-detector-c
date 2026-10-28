@@ -242,6 +242,63 @@ static void test_detector_session_restore(void)
     detector_destroy(d2);
 }
 
+static void test_filter_reload_prunes(void)
+{
+    char *white[] = {"aa:bb:cc:dd:ee:08:40000"};
+    device_filter *f = NULL;
+    char err[512];
+    CHECK(filter_create("whitelist", NULL, 0, white, 1, &f, err, sizeof(err)));
+
+    detector *d = detector_create(2, 5000000000LL, 3000000000LL, f, false, false, 100, 0);
+    sink_ctx sc = {0};
+    alert_sink sink = {.on_alert_start = on_start, .on_alert_end = on_end};
+    detector_set_sink(d, &sink, &sc);
+
+    int64_t t0 = 1700000000000000000LL;
+    pcdn_mac mac = mac_of("aa:bb:cc:dd:ee:08");
+    observation a = mk_obs("aa:bb:cc:dd:ee:08", 40001, "1.1.1.1", t0);
+    observation b = mk_obs("aa:bb:cc:dd:ee:08", 40001, "2.2.2.2", t0);
+    observation c = mk_obs("aa:bb:cc:dd:ee:08", 40002, "3.3.3.3", t0);
+    observation e = mk_obs("aa:bb:cc:dd:ee:08", 40002, "4.4.4.4", t0);
+    detector_observe(d, &a);
+    detector_observe(d, &b);
+    detector_observe(d, &c);
+    detector_observe(d, &e);
+    detector_scan(d, t0);
+    CHECK(sc.starts == 2);
+
+    /* 新名单排除端口 40001：撤销该端口告警并清除状态，40002 不受影响 */
+    char *white2[] = {"aa:bb:cc:dd:ee:08:40001"};
+    device_filter *f2 = NULL;
+    CHECK(filter_create("whitelist", NULL, 0, white2, 1, &f2, err, sizeof(err)));
+    detector_set_filter(d, f2);
+    filter_free(f); /* app 侧释放旧引用，detector 已换成新名单 */
+    CHECK(sc.ends == 1);
+    detector_peer_view pv;
+    CHECK(!detector_peers_page(d, mac, 40001, 17, false, 0, 10, &pv));
+    CHECK(detector_peers_page(d, mac, 40002, 17, false, 0, 10, &pv));
+    detector_peer_view_free(&pv);
+
+    /* 已排除端口的新事件不再记录 */
+    observation f_obs = mk_obs("aa:bb:cc:dd:ee:08", 40001, "5.5.5.5", t0 + 1000);
+    detector_observe(d, &f_obs);
+    CHECK(!detector_peers_page(d, mac, 40001, 17, false, 0, 10, &pv));
+
+    /* 重启继承的会话同样按当前名单过滤 */
+    state_session s;
+    memset(&s, 0, sizeof(s));
+    s.mac = mac;
+    s.port = 40001;
+    s.proto = 17;
+    s.alert_start_ns = t0;
+    s.last_active_ns = t0;
+    detector_restore_sessions(d, &s, 1);
+    CHECK(!detector_peers_page(d, mac, 40001, 17, false, 0, 10, &pv));
+
+    detector_destroy(d);
+    filter_free(f2);
+}
+
 static void test_state(void)
 {
     state_file *st = xcalloc(1, sizeof(*st));
@@ -540,6 +597,7 @@ int main(void)
     test_detector_alerts();
     test_detector_limits();
     test_detector_session_restore();
+    test_filter_reload_prunes();
     test_state();
     if (g_fail) {
         fprintf(stderr, "%d 项检查失败\n", g_fail);
