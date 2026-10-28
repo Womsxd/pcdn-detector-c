@@ -263,7 +263,7 @@ kill -HUP <pid>
 | `[memory] max_ports` | `memory.max_ports` | detector 原地更新（超出部分在下一次扫描收敛） |
 | `[log] level` | `log.level` | 日志等级即时生效 |
 | `[log] timezone` / `hide_address` | `log.timezone` / `log.hide_address` | 时区即时切换；隐私模式影响后续日志掩码 |
-| `[filter]` 黑白名单 | `filter` | 过滤器原地替换 |
+| `[filter]` 黑白名单 | `filter` | 同步名单并清理已排除端口的双栈告警和封禁；同步关联的 UPnP / 全端口封禁设备策略 |
 | `[capture]` 协议 / snaplen / 混杂模式 | `capture` | 在既有抓包 socket 上重设内核 BPF / 切换混杂模式 |
 | `[capture]` 网卡 / 环形缓冲 | `capture` | **原地重开抓包 socket**（TPACKET_V2 不支持在既有 socket 上修改这两项，重开期间可能有极短丢包） |
 | `[firewall]` / `[full_ban]` / `[upnp]` | `firewall` | **原地迁移**：导出 blocker 快照 → 关闭旧 blocker（逐条解封）→ 清理旧后端 → 构建新后端 → 按快照重新下发 |

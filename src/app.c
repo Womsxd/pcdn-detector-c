@@ -870,6 +870,56 @@ static int reload_fallback(app_t *a, const config_t *newcfg, state_file *snap,
     return 0;
 }
 
+/* 两份 MAC 列表内容相同（与顺序无关）：数量一致且每个元素都能在对方找到。 */
+static bool mac_arrays_equal(char **a, size_t na, char **b, size_t nb)
+{
+    if (na != nb)
+        return false;
+    for (size_t i = 0; i < na; i++) {
+        bool found = false;
+        for (size_t j = 0; j < nb && !found; j++)
+            found = strcmp(a[i], b[j]) == 0;
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+/* [full_ban] / [upnp] 的 device 模式设备列表、UPnP 拦截范围由名单条目派生，
+ * 这些变化不体现在 [firewall] / [full_ban] / [upnp] 段本身，需要单独比较；
+ * 否则只改名单条目的 enabled / full_ban / upnp 标记或 list_mode 时，
+ * 防火墙不会迁移，实际拦截策略停留在旧名单上。 */
+static bool filter_device_policy_changed(const config_t *oldcfg, const config_t *newcfg)
+{
+    if (!newcfg->firewall.enabled)
+        return false;
+    char err[256] = {0};
+    if (config_upnp_enabled(newcfg)) {
+        upnp_filter a, b;
+        if (!config_upnp_filter_value(oldcfg, &a, err, sizeof(err)) ||
+            !config_upnp_filter_value(newcfg, &b, err, sizeof(err)))
+            return true;
+        bool diff = a.block_all != b.block_all ||
+                    !mac_arrays_equal(a.devices, a.ndevices, b.devices, b.ndevices);
+        upnp_filter_free(&a);
+        upnp_filter_free(&b);
+        if (diff)
+            return true;
+    }
+    if (config_fullban_enabled(newcfg) && strcmp(newcfg->full_ban.mode, "device") == 0) {
+        char **a = NULL, **b = NULL;
+        size_t na = 0, nb = 0;
+        bool ok = config_fullban_devices(oldcfg, &a, &na, err, sizeof(err)) &&
+                  config_fullban_devices(newcfg, &b, &nb, err, sizeof(err));
+        bool diff = !ok || !mac_arrays_equal(a, na, b, nb);
+        free_str_array(a, na);
+        free_str_array(b, nb);
+        if (diff)
+            return true;
+    }
+    return false;
+}
+
 static int app_reload(void *ctx, reload_result *res, char *err, size_t errlen)
 {
     app_t *a = ctx;
@@ -970,7 +1020,8 @@ static int app_reload(void *ctx, reload_result *res, char *err, size_t errlen)
     /* 2) 防火墙 / blocker */
     bool fw_changed = !config_firewall_equal(&a->cfg, &nc) ||
                       (nc.firewall.enabled &&
-                       strcmp(config_capture_proto(&a->cfg), config_capture_proto(&nc)) != 0);
+                       strcmp(config_capture_proto(&a->cfg), config_capture_proto(&nc)) != 0) ||
+                      filter_device_policy_changed(&a->cfg, &nc);
     if (fw_changed) {
         if (nc.firewall.enabled) {
             char uerr[512] = {0};
