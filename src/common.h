@@ -21,7 +21,7 @@
 #include <time.h>
 
 #ifndef PCDN_BASE_VERSION
-#define PCDN_BASE_VERSION "0.0.1-beta.1"
+#define PCDN_BASE_VERSION "0.0.1-beta.2"
 #endif
 #ifndef PCDN_GIT_HASH
 #define PCDN_GIT_HASH "unknown"

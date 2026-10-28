@@ -13,7 +13,7 @@
 
 repo    = "https://github.com/Womsxd/pcdn-detector"
 mirror  = "https://cnb.cool/womsxd/pcdn-detector"
-commit  = "92d423b9e7fa1f16d73da5bec547568c33b1b544"
-date    = "2026-10-25T23:29:40+08:00"
-version = "0.0.1-beta.1"
-subject = "chore: 版本号升级至 0.0.1-beta.1"
+commit  = "c710959b98197e7d58d66cd9429d5c36bcec2ad9"
+date    = "2026-10-28T21:32:58+08:00"
+version = "0.0.1-beta.2"
+subject = "bump version 0.0.1-beta.2"

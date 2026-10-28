@@ -339,5 +339,5 @@ readelf -p .gnu_debuglink bin/pcdn-detect     # 应显示 pcdn-detect.debug
 
 ```bash
 make GIT_HASH=dev
-./bin/pcdn-detect --version    # 0.0.1-beta.1+dev
+./bin/pcdn-detect --version    # 0.0.1-beta.2+dev
 ```

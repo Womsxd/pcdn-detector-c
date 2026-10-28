@@ -28,7 +28,7 @@
 
 APP       := pcdn-detect
 GIT_HASH  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-VERSION   ?= 0.0.1-beta.1
+VERSION   ?= 0.0.1-beta.2
 
 DEBUG  ?= 0
 STATIC ?= 0

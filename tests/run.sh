@@ -48,7 +48,7 @@ $CC $CFLAGS tests/test_firewall_backends.c $FIREWALL_OBJS -o $OBJ_DIR/test_fw_ba
 ./$OBJ_DIR/test_http
 
 # CLI 冒烟测试
-./bin/pcdn-detect --version | grep -q '0.0.1-beta.1+'
+./bin/pcdn-detect --version | grep -q '0.0.1-beta.2+'
 ./bin/pcdn-detect --help 2>&1 | grep -q 'https://github.com/Womsxd/pcdn-detector-c'
 ./bin/pcdn-detect --help 2>&1 | grep -q 'https://cnb.cool/womsxd/pcdn-detector-c'
 tmp=$(mktemp -d)
